@@ -1,0 +1,126 @@
+[package]
+name = "weaver"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "weaver"
+path = "src/lib.rs"
+
+[[bin]]
+name = "weaver"
+path = "src/main.rs"
+
+[dependencies]
+rmcp = { version = "1.6.0", features = ["server", "transport-io", "transport-streamable-http-server"] }
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+tower-http = { version = "0.6", features = ["cors"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+schemars = "1.2"
+sqlx = { version = "0.7", features = ["sqlite", "runtime-tokio-rustls", "macros", "migrate", "uuid", "chrono"] }
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+clap = { version = "4", features = ["derive", "env"] }
+pulldown-cmark = "0.12"
+glob = "0.3"
+ignore = "0.4"
+thiserror = "2"
+anyhow = "1"
+async-trait = "0.1"
+git2 = { version = "0.20", default-features = false }
+tree-sitter = "0.26"
+walkdir = "2"
+regex = "1"
+minigraf = "=1.0.0"
+text-splitter = "0.25"
+sha2 = "0.10"
+dunce = "1"
+futures = "0.3"
+# Tier 0: docs & metadata formats
+tree-sitter-md = { version = "0.5", optional = true }
+tree-sitter-asciidoc = { version = "0.7.0", optional = true }
+tree-sitter-yaml = { version = "0.7.2", optional = true }
+tree-sitter-toml-ng = { version = "0.7.0", optional = true }
+tree-sitter-json = { version = "0.24.8", optional = true }
+tree-sitter-xml = { version = "0.7.0", optional = true }
+# Tier 1: web/app mainstream languages
+tree-sitter-javascript = { version = "0.23", optional = true }
+tree-sitter-typescript = { version = "0.23", optional = true }
+tree-sitter-python = { version = "0.23", optional = true }
+tree-sitter-java = { version = "0.23", optional = true }
+tree-sitter-go = { version = "0.23", optional = true }
+tree-sitter-rust = { version = "0.24", optional = true }
+# Tier 2: build/devops glue
+tree-sitter-bash = { version = "0.25.1", optional = true }
+tree-sitter-containerfile = { version = "0.8", optional = true }
+tree-sitter-cmake = { version = "0.7.1", optional = true }
+tree-sitter-make = { version = "1.1.1", optional = true }
+tree-sitter-hcl = { version = "1.1.0", optional = true }
+tree-sitter-nix = { version = "0.3.0", optional = true }
+# Tier 3: systems/polyglot expansion
+tree-sitter-c = { version = "0.24.2", optional = true }
+tree-sitter-cpp = { version = "0.23.4", optional = true }
+tree-sitter-c-sharp = { version = "0.23.5", optional = true }
+tree-sitter-php = { version = "0.24.2", optional = true }
+tree-sitter-ruby = { version = "0.23.1", optional = true }
+tree-sitter-swift = { version = "0.7.2", optional = true }
+tree-sitter-scala = { version = "0.26.0", optional = true }
+tree-sitter-elixir = { version = "0.3.5", optional = true }
+tree-sitter-lua = { version = "0.5.0", optional = true }
+tree-sitter-haskell = { version = "0.23.1", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[features]
+default = ["tier3"]
+# Tier 0: docs & metadata formats
+tier0 = [
+	"tree-sitter-md",
+	"tree-sitter-asciidoc",
+	"tree-sitter-yaml",
+	"tree-sitter-toml-ng",
+	"tree-sitter-json",
+	"tree-sitter-xml",
+]
+# Tier 1: web/app mainstream (includes tier0)
+tier1 = [
+	"tier0",
+	"tree-sitter-javascript",
+	"tree-sitter-typescript",
+	"tree-sitter-python",
+	"tree-sitter-java",
+	"tree-sitter-go",
+	"tree-sitter-rust",
+]
+# Tier 2: build/devops glue (includes tier1)
+tier2 = [
+	"tier1",
+	"tree-sitter-bash",
+	"tree-sitter-containerfile",
+	"tree-sitter-cmake",
+	"tree-sitter-make",
+	"tree-sitter-hcl",
+	"tree-sitter-nix",
+]
+# Tier 3: systems/polyglot expansion (includes tier2)
+tier3 = [
+	"tier2",
+	"tree-sitter-c",
+	"tree-sitter-cpp",
+	"tree-sitter-c-sharp",
+	"tree-sitter-php",
+	"tree-sitter-ruby",
+	"tree-sitter-swift",
+	"tree-sitter-scala",
+	"tree-sitter-elixir",
+	"tree-sitter-lua",
+	"tree-sitter-haskell",
+]

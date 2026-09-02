@@ -1,0 +1,9 @@
+*
+!.agents/weaver/SKILL.md
+!migrations/
+!migrations/**
+!src/
+!src/**
+!README.md
+!TECHNICAL_BEHAVIOR.md
+!Cargo.toml

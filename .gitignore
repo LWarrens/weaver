@@ -1,0 +1,13 @@
+AGENTS.md
+build/
+node_modules
+target/
+target*/
+*.db
+*.db-shm
+*.db-wal
+reference_papers/
+.claude/
+dist/
+logs/
+.weaver.yaml
