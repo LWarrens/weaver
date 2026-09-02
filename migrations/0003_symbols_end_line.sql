@@ -1,0 +1,1 @@
+ALTER TABLE symbols ADD COLUMN end_line INTEGER;
