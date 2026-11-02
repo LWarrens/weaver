@@ -17,6 +17,59 @@ use crate::error::Error;
 use super::*;
 
 impl SqliteStore {
+    /// The symbol lane's declared facts as stable, ID-free strings, for the
+    /// offline integrity oracle: open symbols, open call-graph edges, open file
+    /// imports, and open routes, each keyed by file path and symbol name rather
+    /// than by row UUID so two independently built stores compare equal.
+    ///
+    /// Communities are deliberately excluded: label propagation is a derived
+    /// summary, not a declared fact. Edges are not filtered on the source
+    /// symbol's validity, so an open edge left dangling on a retired symbol
+    /// shows up as surplus in the live index.
+    pub async fn symbol_declared_facts(&self, repo_id: Uuid) -> Result<Vec<String>, Error> {
+        let rows: Vec<String> = sqlx::query_scalar(
+            r#"SELECT 'symbol|' || f.path || '|' || s.kind || '|' || s.name
+                      || '|' || COALESCE(s.line, '') || '|' || COALESCE(s.end_line, '')
+                      || '|' || COALESCE(s.signature, '') || '|' || COALESCE(s.return_type, '')
+                      || '|' || COALESCE(s.visibility, '') || '|' || s.is_async
+                      || '|' || COALESCE(s.complexity, '') || '|' || COALESCE(s.decorators, '')
+               FROM symbols s
+               JOIN files f ON f.id = s.file_id
+               WHERE f.repo_id = ?1 AND s.valid_to IS NULL
+               UNION ALL
+               SELECT 'edge|' || ff.path || '|' || fs.name || '|' || e.edge_type
+                      || '|' || COALESCE(tf.path, '') || '|' || COALESCE(ts.name, e.to_name, '')
+                      || '|' || e.resolution || '|' || printf('%.2f', e.confidence)
+               FROM symbol_edges e
+               JOIN symbols fs ON fs.id = e.from_id
+               JOIN files ff ON ff.id = fs.file_id
+               LEFT JOIN symbols ts ON ts.id = e.to_id
+               LEFT JOIN files tf ON tf.id = ts.file_id
+               WHERE e.repo_id = ?1 AND e.valid_to IS NULL
+               UNION ALL
+               SELECT 'import|' || ff.path || '|' || i.imported_name
+                      || '|' || COALESCE(i.module_spec, '') || '|' || COALESCE(tf.path, '')
+                      || '|' || COALESCE(ts.name, '')
+               FROM file_imports i
+               JOIN files ff ON ff.id = i.from_file_id
+               LEFT JOIN files tf ON tf.id = i.to_file_id
+               LEFT JOIN symbols ts ON ts.id = i.to_symbol_id
+               WHERE i.repo_id = ?1 AND i.valid_to IS NULL
+               UNION ALL
+               SELECT 'route|' || COALESCE(r.method, '') || '|' || r.path
+                      || '|' || COALESCE(r.framework, '') || '|' || r.file_path || ':' || r.line
+                      || '|' || COALESCE(hs.name, '') || '|' || r.resolution
+                      || '|' || printf('%.2f', r.confidence)
+               FROM routes r
+               LEFT JOIN symbols hs ON hs.id = r.handler_id
+               WHERE r.repo_id = ?1 AND r.valid_to IS NULL"#,
+        )
+        .bind(repo_id.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
     // -----------------------------------------------------------------------
     // Files & Symbols (Phase 2)
     // -----------------------------------------------------------------------
@@ -28,16 +81,26 @@ impl SqliteStore {
         ingested_at: &str,
         valid_from: &str,
     ) -> Result<Uuid, Error> {
-        let row =
-            sqlx::query("SELECT id FROM files WHERE repo_id = ? AND path = ? AND valid_to IS NULL")
-                .bind(repo_id.to_string())
-                .bind(path)
-                .fetch_optional(&self.pool)
-                .await?;
+        // (repo_id, path) is unique across history, so a file that was retired and
+        // has reappeared is reopened rather than inserted again.
+        let row = sqlx::query("SELECT id, valid_to FROM files WHERE repo_id = ? AND path = ?")
+            .bind(repo_id.to_string())
+            .bind(path)
+            .fetch_optional(&self.pool)
+            .await?;
 
         if let Some(r) = row {
             let id_str: String = r.get("id");
-            return Ok(Uuid::parse_str(&id_str).map_err(|e| Error::Parse(e.to_string()))?);
+            let id = Uuid::parse_str(&id_str).map_err(|e| Error::Parse(e.to_string()))?;
+            if r.get::<Option<String>, _>("valid_to").is_some() {
+                sqlx::query("UPDATE files SET valid_to = NULL, valid_from = ?, ingested_at = ? WHERE id = ?")
+                    .bind(valid_from)
+                    .bind(ingested_at)
+                    .bind(&id_str)
+                    .execute(&self.pool)
+                    .await?;
+            }
+            return Ok(id);
         }
 
         let id = Uuid::new_v4();
@@ -174,6 +237,180 @@ impl SqliteStore {
         .bind(is_async as i64)
         .bind(complexity)
         .bind(decorators)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Retire every open file of the repo for which `is_gone(path)` holds:
+    /// close its symbols, their outgoing edges, its imports and its routes,
+    /// detach other files' imports that pointed into it, and clear its content
+    /// hash so the file is re-indexed if it later reappears unchanged.
+    pub async fn retire_files_where(
+        &self,
+        repo_id: Uuid,
+        is_gone: &(dyn Fn(&str) -> bool + Sync),
+        valid_to: &str,
+    ) -> Result<(), Error> {
+        let rows = sqlx::query("SELECT id, path FROM files WHERE repo_id = ? AND valid_to IS NULL")
+            .bind(repo_id.to_string())
+            .fetch_all(&self.pool)
+            .await?;
+        for row in rows {
+            let path: String = row.get("path");
+            if !is_gone(&path) {
+                continue;
+            }
+            let file_id: String = row.get("id");
+            sqlx::query(
+                "UPDATE symbol_edges SET valid_to = ?1 WHERE valid_to IS NULL
+                   AND from_id IN (SELECT id FROM symbols WHERE file_id = ?2)",
+            )
+            .bind(valid_to)
+            .bind(&file_id)
+            .execute(&self.pool)
+            .await?;
+            sqlx::query("UPDATE symbols SET valid_to = ? WHERE file_id = ? AND valid_to IS NULL")
+                .bind(valid_to)
+                .bind(&file_id)
+                .execute(&self.pool)
+                .await?;
+            sqlx::query(
+                "UPDATE file_imports SET valid_to = ? WHERE from_file_id = ? AND valid_to IS NULL",
+            )
+            .bind(valid_to)
+            .bind(&file_id)
+            .execute(&self.pool)
+            .await?;
+            sqlx::query(
+                "UPDATE file_imports SET to_file_id = NULL, to_symbol_id = NULL
+                 WHERE to_file_id = ? AND valid_to IS NULL",
+            )
+            .bind(&file_id)
+            .execute(&self.pool)
+            .await?;
+            self.close_stale_routes_for_file(repo_id, &path, valid_to)
+                .await?;
+            // Close the file row too: an open row for an ignored or deleted file
+            // would keep other files' module specifiers resolving to it. A file
+            // that reappears gets a fresh row from `upsert_file`.
+            sqlx::query("UPDATE files SET content_hash = NULL, valid_to = ? WHERE id = ?")
+                .bind(valid_to)
+                .bind(&file_id)
+                .execute(&self.pool)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Number of open symbols per name across the repo. Resolution by unique
+    /// name depends on these counts, so a run that changes one invalidates every
+    /// edge that was resolved (or left unresolved) against it.
+    pub async fn open_symbol_name_counts(
+        &self,
+        repo_id: Uuid,
+    ) -> Result<std::collections::HashMap<String, i64>, Error> {
+        let rows = sqlx::query(
+            "SELECT s.name AS name, COUNT(*) AS n FROM symbols s
+               JOIN files f ON f.id = s.file_id
+              WHERE f.repo_id = ? AND s.valid_to IS NULL
+              GROUP BY s.name",
+        )
+        .bind(repo_id.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| (r.get::<String, _>("name"), r.get::<i64, _>("n")))
+            .collect())
+    }
+
+    /// Paths of live files owning a symbol with an open non-`contains` edge whose
+    /// `to_name` is one of `names`.
+    pub async fn files_with_open_edges_to_names(
+        &self,
+        repo_id: Uuid,
+        names: &[String],
+    ) -> Result<Vec<String>, Error> {
+        let names_json =
+            serde_json::to_string(names).map_err(|e| Error::Parse(e.to_string()))?;
+        let rows = sqlx::query(
+            "SELECT DISTINCT f.path AS path
+               FROM symbol_edges e
+               JOIN symbols s ON s.id = e.from_id
+               JOIN files f ON f.id = s.file_id
+              WHERE e.repo_id = ?1 AND e.valid_to IS NULL AND e.edge_type != 'contains'
+                AND s.valid_to IS NULL AND f.valid_to IS NULL
+                AND e.to_name IN (SELECT value FROM json_each(?2))",
+        )
+        .bind(repo_id.to_string())
+        .bind(names_json)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|r| r.get::<String, _>("path")).collect())
+    }
+
+    /// Close every open `contains` edge whose container is a symbol of `file_id`.
+    /// Called before a re-ingested file's `contains` edges are re-emitted, so the
+    /// previous set does not linger next to the new one.
+    pub async fn close_contains_edges_for_file(
+        &self,
+        file_id: Uuid,
+        valid_to: &str,
+    ) -> Result<(), Error> {
+        sqlx::query(
+            "UPDATE symbol_edges SET valid_to = ?1
+              WHERE edge_type = 'contains' AND valid_to IS NULL
+                AND from_id IN (SELECT id FROM symbols WHERE file_id = ?2)",
+        )
+        .bind(valid_to)
+        .bind(file_id.to_string())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Close every open edge whose source symbol has been retired. Retiring a
+    /// symbol (removed from a re-ingested file, or its file deleted) must take its
+    /// outgoing edges with it; this sweep also repairs indexes that predate that.
+    pub async fn close_edges_from_retired_symbols(
+        &self,
+        repo_id: Uuid,
+        valid_to: &str,
+    ) -> Result<(), Error> {
+        sqlx::query(
+            "UPDATE symbol_edges SET valid_to = ?1
+              WHERE repo_id = ?2 AND valid_to IS NULL
+                AND from_id IN (SELECT id FROM symbols WHERE valid_to IS NOT NULL)",
+        )
+        .bind(valid_to)
+        .bind(repo_id.to_string())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Detach open cross-file edges and imports whose target symbol has been
+    /// retired (renamed, removed, or its file deleted). Edges go back to
+    /// `unresolved` so the name-based re-resolution pass can re-attach them if a
+    /// unique match exists, exactly as a from-scratch ingest would resolve them.
+    /// `contains` edges are intra-file and are closed with their file.
+    pub async fn unresolve_edges_to_retired_symbols(&self, repo_id: Uuid) -> Result<(), Error> {
+        sqlx::query(
+            "UPDATE symbol_edges
+                SET to_id = NULL, confidence = 0.3, resolution = 'unresolved'
+              WHERE repo_id = ? AND valid_to IS NULL AND edge_type != 'contains'
+                AND to_id IN (SELECT id FROM symbols WHERE valid_to IS NOT NULL)",
+        )
+        .bind(repo_id.to_string())
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "UPDATE file_imports SET to_symbol_id = NULL
+              WHERE repo_id = ? AND valid_to IS NULL
+                AND to_symbol_id IN (SELECT id FROM symbols WHERE valid_to IS NOT NULL)",
+        )
+        .bind(repo_id.to_string())
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -368,8 +605,8 @@ impl SqliteStore {
     pub async fn insert_symbol_edge(&self, edge: &SymbolEdge) -> Result<(), Error> {
         sqlx::query(
             r#"INSERT OR IGNORE INTO symbol_edges
-               (id, repo_id, from_id, to_id, to_name, edge_type, confidence, valid_from)
-               VALUES (?,?,?,?,?,?,?,?)"#,
+               (id, repo_id, from_id, to_id, to_name, edge_type, confidence, valid_from, resolution)
+               VALUES (?,?,?,?,?,?,?,?,?)"#,
         )
         .bind(edge.id.to_string())
         .bind(edge.repo_id.to_string())
@@ -379,19 +616,25 @@ impl SqliteStore {
         .bind(&edge.edge_type)
         .bind(edge.confidence)
         .bind(&edge.valid_from)
+        .bind(&edge.resolution)
         .execute(&self.pool)
         .await?;
         Ok(())
     }
 
-    /// Remove all live edges originating from `from_id` (when a file is re-ingested).
+    /// Remove the live call / import / type edges originating from `from_id` (when
+    /// a file is re-ingested). `contains` edges are structural and owned by
+    /// [`Self::close_contains_edges_for_file`]: this must not close them, or a
+    /// container with an edge of its own (a class with a base class) would lose
+    /// the `contains` edges emitted for it moments earlier.
     pub async fn close_stale_edges_for_symbol(
         &self,
         from_id: Uuid,
         valid_to: &str,
     ) -> Result<(), Error> {
         sqlx::query(
-            "UPDATE symbol_edges SET valid_to = ? WHERE from_id = ? AND valid_to IS NULL",
+            "UPDATE symbol_edges SET valid_to = ?
+              WHERE from_id = ? AND valid_to IS NULL AND edge_type != 'contains'",
         )
         .bind(valid_to)
         .bind(from_id.to_string())
@@ -438,13 +681,100 @@ impl SqliteStore {
         edge_id: Uuid,
         to_id: Uuid,
         confidence: f64,
+        resolution: &str,
     ) -> Result<(), Error> {
-        sqlx::query("UPDATE symbol_edges SET to_id = ?, confidence = ? WHERE id = ?")
+        sqlx::query(
+            "UPDATE symbol_edges SET to_id = ?, confidence = ?, resolution = ? WHERE id = ?",
+        )
             .bind(to_id.to_string())
             .bind(confidence)
+            .bind(resolution)
             .bind(edge_id.to_string())
             .execute(&self.pool)
             .await?;
+        Ok(())
+    }
+
+    /// Resolve `type_name::member_name` to a symbol UUID via `contains` edges:
+    /// the unique live symbol named `member_name` contained by a live symbol named
+    /// `type_name` in this repo. Returns `None` unless exactly one match exists.
+    /// Confidence tier: receiver-type resolution (0.9).
+    pub async fn find_symbol_id_by_type_and_name(
+        &self,
+        repo_id: Uuid,
+        type_name: &str,
+        member_name: &str,
+    ) -> Result<Option<Uuid>, Error> {
+        let rows = sqlx::query(
+            r#"SELECT DISTINCT m.id AS id
+               FROM symbols t
+               JOIN symbol_edges e
+                 ON e.from_id = t.id AND e.edge_type = 'contains' AND e.valid_to IS NULL
+               JOIN symbols m
+                 ON m.id = e.to_id AND m.valid_to IS NULL
+               JOIN files f ON f.id = t.file_id
+               WHERE f.repo_id = ? AND t.valid_to IS NULL
+                 AND t.name = ? AND m.name = ?"#,
+        )
+        .bind(repo_id.to_string())
+        .bind(type_name)
+        .bind(member_name)
+        .fetch_all(&self.pool)
+        .await?;
+
+        if rows.len() != 1 {
+            return Ok(None);
+        }
+        let s: String = rows[0].get("id");
+        Ok(Some(
+            Uuid::parse_str(&s).map_err(|e| Error::Parse(e.to_string()))?,
+        ))
+    }
+
+    /// Close (bitemporally end) all live `file_imports` rows for a source file,
+    /// called before re-inserting them on re-ingest.
+    pub async fn close_stale_file_imports_for_file(
+        &self,
+        from_file_id: Uuid,
+        valid_to: &str,
+    ) -> Result<(), Error> {
+        sqlx::query(
+            "UPDATE file_imports SET valid_to = ? WHERE from_file_id = ? AND valid_to IS NULL",
+        )
+        .bind(valid_to)
+        .bind(from_file_id.to_string())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Insert a resolved import row. Idempotent on `(from_file_id, imported_name, valid_from)`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_file_import(
+        &self,
+        repo_id: Uuid,
+        from_file_id: Uuid,
+        imported_name: &str,
+        module_spec: Option<&str>,
+        to_file_id: Option<Uuid>,
+        to_symbol_id: Option<Uuid>,
+        valid_from: &str,
+    ) -> Result<(), Error> {
+        sqlx::query(
+            r#"INSERT OR IGNORE INTO file_imports
+               (id, repo_id, from_file_id, imported_name, module_spec, to_file_id, to_symbol_id, valid_from)
+               VALUES (?,?,?,?,?,?,?,?)"#,
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(repo_id.to_string())
+        .bind(from_file_id.to_string())
+        .bind(imported_name)
+        .bind(module_spec)
+        .bind(to_file_id.map(|u| u.to_string()))
+        .bind(to_symbol_id.map(|u| u.to_string()))
+        .bind(valid_from)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -520,11 +850,12 @@ impl SqliteStore {
         line: i64,
         confidence: f64,
         valid_from: &str,
+        resolution: &str,
     ) -> Result<(), Error> {
         sqlx::query(
             r#"INSERT OR IGNORE INTO routes
-               (id, repo_id, method, path, framework, handler_id, file_path, line, confidence, valid_from)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+               (id, repo_id, method, path, framework, handler_id, file_path, line, confidence, valid_from, resolution)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
         .bind(id.to_string())
         .bind(repo_id.to_string())
@@ -536,6 +867,7 @@ impl SqliteStore {
         .bind(line)
         .bind(confidence)
         .bind(valid_from)
+        .bind(resolution)
         .execute(&self.pool)
         .await?;
         Ok(())

@@ -684,6 +684,27 @@ impl SqliteStore {
         .fetch_one(&self.pool)
         .await?;
 
+        let prs_total: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pull_requests WHERE repo_id = ?",
+        )
+        .bind(&rid)
+        .fetch_one(&self.pool)
+        .await?;
+
+        let prs_embedded: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pull_requests WHERE repo_id = ? AND embedding IS NOT NULL",
+        )
+        .bind(&rid)
+        .fetch_one(&self.pool)
+        .await?;
+
+        let prs_last_ingested_at: Option<String> = sqlx::query_scalar(
+            "SELECT MAX(ingested_at) FROM pull_requests WHERE repo_id = ?",
+        )
+        .bind(&rid)
+        .fetch_one(&self.pool)
+        .await?;
+
         let symbols_total: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM symbols s JOIN files f ON f.id = s.file_id WHERE f.repo_id = ?",
         )
@@ -737,6 +758,9 @@ impl SqliteStore {
             commits_total,
             commits_embedded,
             commits_last_ingested_at,
+            prs_total,
+            prs_embedded,
+            prs_last_ingested_at,
             symbols_total,
             symbols_embedded,
             symbols_last_ingested_at,

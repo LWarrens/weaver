@@ -21,6 +21,66 @@ impl SqliteStore {
     // ADR documents
     // -----------------------------------------------------------------------
 
+    /// Natural-key fingerprints of the ADR lane's declared facts, one string per
+    /// row, for the integrity oracle (REQ-058). No UUID or timestamp appears in a
+    /// key, so a live index and a from-scratch rebuild compare equal when they
+    /// declare the same facts. Duplicate strings are meaningful: callers compare
+    /// multisets.
+    ///
+    /// Only the latest document version per `adr_id` is projected (a full
+    /// re-sync has no history). Links and edges are deliberately not filtered by
+    /// their decision's validity: an open row hanging off a closed decision is
+    /// exactly the stale state the oracle exists to surface.
+    ///
+    /// `mentions` edges are not projected: the ADR parser never fills service or
+    /// module mentions, so ADR sync cannot currently create them.
+    pub async fn adr_declared_facts(&self, repo_id: Uuid) -> Result<Vec<String>, Error> {
+        let rows: Vec<String> = sqlx::query_scalar(
+            r#"WITH latest AS (
+                   SELECT a.id, a.adr_id, a.title, a.status, a.valid_to
+                   FROM adr_documents a
+                   WHERE a.repo_id = ?1
+                     AND a.id = (SELECT b.id FROM adr_documents b
+                                 WHERE b.repo_id = a.repo_id AND b.adr_id = a.adr_id
+                                 ORDER BY b.ingested_at DESC, b.valid_from DESC LIMIT 1)
+               )
+               SELECT 'adr|' || adr_id || '|' || status || '|'
+                      || CASE WHEN valid_to IS NULL THEN 'open' ELSE 'closed' END
+                      || '|' || title
+               FROM latest
+               UNION ALL
+               SELECT 'supersedes|' || n.adr_id || '|' || o.adr_id
+               FROM supersession_edges s
+               JOIN latest n ON n.id = s.superseder_id
+               JOIN latest o ON o.id = s.superseded_id
+               UNION ALL
+               SELECT 'link|' || a.adr_id || '|' || dcl.file_path || '|'
+                      || COALESCE(dcl.symbol, '') || '|' || dcl.link_type
+                      || '|' || printf('%.2f', dcl.confidence)
+               FROM decision_code_links dcl
+               JOIN decisions d ON d.id = dcl.decision_id
+               JOIN adr_documents a ON a.id = d.adr_id
+               WHERE a.repo_id = ?1 AND dcl.valid_to IS NULL AND dcl.link_source = 'adr_text'
+               UNION ALL
+               SELECT 'defines|' || a.adr_id || '|' || printf('%.2f', te.confidence)
+               FROM temporal_edges te
+               JOIN decisions d ON d.id = te.target_id
+               JOIN adr_documents a ON a.id = d.adr_id
+               WHERE te.edge_type = 'defines' AND te.valid_to IS NULL AND a.repo_id = ?1
+               UNION ALL
+               SELECT 'imposes|' || a.adr_id || '|' || c.text || '|' || printf('%.2f', te.confidence)
+               FROM temporal_edges te
+               JOIN decisions d ON d.id = te.source_id
+               JOIN constraints c ON c.id = te.target_id
+               JOIN adr_documents a ON a.id = d.adr_id
+               WHERE te.edge_type = 'imposes' AND te.valid_to IS NULL AND a.repo_id = ?1"#,
+        )
+        .bind(repo_id.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
     pub async fn find_current_adr(
         &self,
         repo_id: Uuid,
@@ -141,5 +201,4 @@ impl SqliteStore {
 
         rows.iter().map(|r| row_to_adr(r)).collect()
     }
-
 }

@@ -434,7 +434,7 @@ pub struct RebuildObligation {
 
 ---
 
-## Components (spec + role, per AGENTS.md)
+## Components (spec + role)
 
 | Component | Spec | Role |
 |---|---|---|
@@ -746,5 +746,8 @@ table, remove the two Open Requirements).
   re-export from an external crate terminates at the crate boundary as
   `unknown`-grade with no anchor.
 - **Lane `lag` for non-git repos.** `lag_commits` is `null`; fall back to the
-  existing timestamp comparison in `warnings`.
+  existing timestamp comparison in `warnings`. *Resolved:* `index_status`
+  compares each source-derived lane's `last_ingested_at` with the newest
+  modification time among the files that lane reads, using ingest's own ignore
+  rules (`freshness::timestamp_staleness_warnings`).
 ```

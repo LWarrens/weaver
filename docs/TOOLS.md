@@ -287,9 +287,42 @@ Two confidence tiers for linking commits to decisions:
 
 ---
 
+### `sync_prs_from_git`
+
+Derives pull requests from the merge and squash commits git already carries, stores them in `pull_requests`, and links them to decisions via `decision_git_links` with `ref_type = 'pr'`. Recognises GitHub, Bitbucket, and GitLab merge subjects plus the squash form `title (#123)`.
+
+Linking uses the same two confidence tiers as commit ingestion:
+- `0.95` — explicit ADR ID found in the PR title, body, or reviews
+- `0.6` — keyword overlap with decision text
+
+Because a merged PR is immutable, the evidence anchors it creates on a decision's claims never go stale.
+
+```json
+{
+  "repo_path": "string",
+  "branch": "string | null",
+  "since": "string | null",
+  "limit": "integer | null",
+  "enrich": "boolean | null",
+  "mine_decisions": "boolean | null"
+}
+```
+
+Returns `{ prs_ingested, prs_unchanged, prs_enriched, prs_not_a_pr, links_created, episodes_recorded, facts_mined, enrichment_mode, warnings }`. Idempotent on `(repo_id, pr_ref)`.
+
+**Enrichment (optional).** When `enrich` is not `false`, the `origin` remote is GitHub, and `WEAVER_GITHUB_TOKEN` (or `GITHUB_TOKEN`) is set, each git-derived stub is upgraded in place with the PR body, author, state, URL, and review bodies, and `enrichment_mode` is `github`. Otherwise the run continues in `git_only` mode and explains why in `warnings` — no token, network, or GitHub remote is ever required. Set `WEAVER_GITHUB_API_BASE` for GitHub Enterprise.
+
+**Verifying `(#N)` refs.** A squash subject ending in `(#N)` could be an issue reference. With enrichment active, weaver checks: if GitHub confirms `N` is an issue (not a PR), a new ref is skipped and counted in `prs_not_a_pr`; one already ingested is reported in `warnings` and left in place. If GitHub cannot confirm either way (a 404 also covers repos the token cannot see) the PR is kept as `enrichment: git`, i.e. unverified. Merge-commit PRs are never dropped.
+
+**Decision mining (optional).** With `mine_decisions` (default true), PR text is recorded as an episode and put through LLM fact extraction, surfacing architectural facts that were never written up as an ADR. A PR is never itself promoted to an accepted decision — extracted facts land as temporal edges carrying the model's own confidence, and model output never enters at `proven` grade. Mining runs only when a PR is first seen or first enriched, so re-syncs do not re-invoke the LLM. Without an LLM provider configured the PR is still stored as an episode, with a warning.
+
+Run after `sync_commits_from_git` so PRs can be associated with their merge commit; otherwise the PR is still ingested and a warning names the missing commit.
+
+---
+
 ### `embed_all`
 
-Backfills vector embeddings for all decisions, constraints, episodes, commits, symbols, and entity nodes that do not yet have one. Run this after enabling an embedding provider on a repository that was already partially ingested, and again after `synthesize_adr_leads` to make leads searchable.
+Backfills vector embeddings for all decisions, constraints, episodes, commits, pull requests, symbols, and entity nodes that do not yet have one. Run this after enabling an embedding provider on a repository that was already partially ingested, and again after `synthesize_adr_leads` to make leads searchable.
 
 ```json
 {
@@ -298,7 +331,7 @@ Backfills vector embeddings for all decisions, constraints, episodes, commits, s
 }
 ```
 
-Processes all six entity types with up to 8 concurrent embedding requests. Returns `{ decisions_embedded, constraints_embedded, episodes_embedded, commits_embedded, symbols_embedded, entity_nodes_embedded, warnings, warnings_total }`. Requires `WEAVER_EMBEDDING_PROVIDER` to be configured; returns an explanatory warning and does nothing if no provider is set.
+Processes all seven entity types with up to 8 concurrent embedding requests. Returns `{ decisions_embedded, constraints_embedded, episodes_embedded, commits_embedded, pull_requests_embedded, symbols_embedded, entity_nodes_embedded, warnings, warnings_total }`. Requires `WEAVER_EMBEDDING_PROVIDER` to be configured; returns an explanatory warning and does nothing if no provider is set.
 
 ---
 
@@ -395,14 +428,17 @@ Verifies the evidence anchors behind an ADR, decision, file, or symbol against t
 
 ### `verify_index_integrity`
 
-Offline integrity oracle. Rebuilds the ADR index lane from scratch in a throwaway store and diffs its declared-fact projection against the live index, reporting `clean` / `divergent` / `not_audited` per lane plus the diverging claim projections. For CI or manual auditing — never on the query path.
+Offline integrity oracle. Rebuilds the ADR and symbol index lanes from scratch in a throwaway store and diffs their declared-fact projections against the live index, reporting `clean` / `divergent` / `not_audited` per lane plus the diverging projection keys (ADR: claims, status, supersession, code links, temporal edges; symbol: symbols, call-graph edges, file imports, routes). The `symbol` lane is `not_audited` when the live index has never been symbol-indexed; the `commit` lane has no incremental path and is always `not_audited`. For CI or manual auditing — never on the query path.
 
 ```json
 {
   "repo_path": "string",
-  "adr_glob": "string | null"
+  "adr_glob": "string | null",
+  "symbol_glob": "string | null"
 }
 ```
+
+`symbol_glob` should match the `pattern` the live symbol index was built with (default: all supported files); a live index built with a narrower pattern reads as divergent.
 
 ---
 
@@ -604,6 +640,54 @@ Returns:
 
 ---
 
+### `dedup_decisions`
+
+Finds and merges duplicate episode-sourced decisions that predate ingest-time dedup (`record_decision_episode` merges new duplicates as they arrive). **Dry run by default**: it reports the merges and changes nothing until `dry_run` is `false`.
+
+```json
+{
+  "repo_path": "string",
+  "dry_run": "boolean | null",
+  "threshold": "number | null"
+}
+```
+
+Matching is the same as at ingest: normalized-exact text, or cosine similarity of the **stored** embeddings at or above `threshold` (default `0.9`; `1.0` merges only identical text or identical vectors). It makes no provider calls, so a decision with no stored embedding can only match by exact text; run `embed_all` and go again to catch the rest.
+
+Only episode-sourced decisions are ever merged away. ADR decisions are evidence, so they only survive: an episode decision that repeats an ADR decision folds into it, whichever was ingested first. Otherwise the older decision survives.
+
+A merge, per duplicate:
+
+* moves the duplicate's open constraints the survivor lacks (and their `imposes` edges) to the survivor; ones it already has are closed with the duplicate;
+* moves code links to files the survivor is not linked to, and git links, and re-points open temporal edges;
+* records a `supports` Episode → Decision edge carrying the similarity, so the merge stays auditable;
+* soft-closes the duplicate (`valid_to`, with its remaining constraints and claims), as `retract` would.
+
+The re-homing is one transaction and every step is a no-op the second time, so an interrupted run is finished by running it again.
+
+Returns:
+
+```json
+{
+  "dry_run": true,
+  "threshold": 0.9,
+  "decisions_examined": 42,
+  "merges": [
+    {
+      "loser_id": "uuid", "loser_title": "string",
+      "survivor_id": "uuid", "survivor_title": "string",
+      "similarity": 0.97, "method": "exact | semantic",
+      "constraints_moved": 1, "constraints_duplicate": 1
+    }
+  ],
+  "merged": 0,
+  "decisions_without_embedding": 3,
+  "warnings": []
+}
+```
+
+---
+
 ### `trace_call_path`
 
 Traverses the call graph via `symbol_edges` to answer "who calls this?" (inbound) or "what does this call?" (outbound) up to a configurable depth. Replaces O(depth) grep-and-read loops with a single graph query.
@@ -673,7 +757,7 @@ Returns indexing freshness and embedding coverage for a repository. Distinguishe
 }
 ```
 
-Returns per-entity status for ADRs (total, last sync), files (total, last ingested), and embeddable entities (decisions, constraints, episodes, commits, symbols): total count, embedded count, coverage ratio (0.0–1.0), and last ingestion timestamp.
+Returns per-entity status for ADRs (total, last sync), files (total, last ingested), and embeddable entities (decisions, constraints, episodes, commits, pull requests, symbols): total count, embedded count, coverage ratio (0.0–1.0), and last ingestion timestamp. `lanes` gives per-lane freshness; `lag_commits` is `null` when the repo has no git HEAD, and `warnings` then reports any source-derived lane (`adr`, `symbol`, `route`, `community`) whose files changed after it was last indexed, by modification time.
 
 ---
 
@@ -821,7 +905,7 @@ Lists every repository stored in the architectural memory database, with per-rep
 
 ### `delete_repo`
 
-Permanently deletes a repository and all associated data — symbols, decisions, constraints, commits, ADRs, edges, embeddings. Irreversible.
+Permanently deletes a repository and all associated data — ADRs, decisions (both ADR- and episode-sourced) and their constraints and links, files, symbols and symbol edges, communities, routes, commits, pull requests, episodes, entity nodes, temporal edges, claims, evidence anchors and verifications, index lanes, freshness manifests, and file imports. Runs in a single transaction. Irreversible.
 
 ```json
 { "repo_path": "string" }
@@ -831,7 +915,7 @@ Permanently deletes a repository and all associated data — symbols, decisions,
 
 ### `get_graph_snapshot`
 
-Returns a node/edge snapshot of the knowledge graph for interactive relationship visualization (used by the manager client). Not a reasoning tool.
+Returns a node/edge snapshot of the knowledge graph for interactive relationship visualization (used by the manager client). Not a reasoning tool. Pull requests appear as `pull_request` nodes when they are linked to a decision (`references_pr` edge) or to their merge commit (`includes` edge); run `sync_prs_from_git` first.
 
 ```json
 {

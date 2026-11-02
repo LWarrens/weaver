@@ -1,0 +1,22 @@
+%%{init: {"theme": "neutral", "themeVariables": {"fontSize": "16px"}}}%%
+flowchart LR
+    Q["<b>query</b> { text }"]
+
+    Q --> K["<b>Keyword</b><br/>SQLite FTS"]
+    Q --> S["<b>Semantic</b><br/>embeddings<br/><i>optional provider</i>"]
+    Q --> GR["<b>Graph</b><br/>BFS over typed<br/>temporal edges"]
+
+    K --> RRF
+    S --> RRF
+    GR --> RRF
+
+    RRF["<b>Reciprocal Rank Fusion</b><br/>one ranked list from three"]
+
+    RRF --> OUT(["<b>Answer</b> + decisions · constraints ·<br/>evidence · confidence<br/><i>full retrieval provenance via explain_answer</i>"])
+
+    style Q fill:#f7e6c4,stroke:#b8934a
+    style K fill:#dbe9f6,stroke:#5b7fa6
+    style S fill:#dbe9f6,stroke:#5b7fa6
+    style GR fill:#dbe9f6,stroke:#5b7fa6
+    style RRF fill:#f7e6c4,stroke:#b8934a
+    style OUT fill:#dcecdc,stroke:#5f9e6e

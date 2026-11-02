@@ -101,6 +101,93 @@ impl SqliteStore {
 
         let mut tx = self.pool.begin().await?;
 
+        // Decisions are XOR-sourced — `adr_id` or `episode_id` (migration 0002)
+        // — so every decision-scoped delete must follow both branches. Following
+        // only the ADR branch silently orphans every episode-sourced decision.
+        const OWNED_DECISIONS: &str = "SELECT id FROM decisions \
+             WHERE adr_id IN (SELECT id FROM adr_documents WHERE repo_id = ?) \
+                OR episode_id IN (SELECT id FROM episodes WHERE repo_id = ?)";
+
+        // ----- collect this repo's entity ids -----
+        //
+        // `temporal_edges` has no repo_id and stores opaque endpoints, so the
+        // only way to scope it is to enumerate the ids this repo owns.
+        sqlx::query("DROP TABLE IF EXISTS temp.owned_ids")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("CREATE TEMP TABLE owned_ids (id TEXT PRIMARY KEY)")
+            .execute(&mut *tx)
+            .await?;
+
+        for stmt in [
+            "INSERT OR IGNORE INTO owned_ids SELECT id FROM adr_documents WHERE repo_id = ?",
+            "INSERT OR IGNORE INTO owned_ids SELECT id FROM episodes WHERE repo_id = ?",
+            "INSERT OR IGNORE INTO owned_ids SELECT id FROM commits WHERE repo_id = ?",
+            "INSERT OR IGNORE INTO owned_ids SELECT id FROM pull_requests WHERE repo_id = ?",
+            "INSERT OR IGNORE INTO owned_ids SELECT id FROM entity_nodes WHERE repo_id = ?",
+            "INSERT OR IGNORE INTO owned_ids SELECT id FROM files WHERE repo_id = ?",
+            "INSERT OR IGNORE INTO owned_ids SELECT id FROM communities WHERE repo_id = ?",
+            "INSERT OR IGNORE INTO owned_ids SELECT id FROM symbols \
+             WHERE file_id IN (SELECT id FROM files WHERE repo_id = ?)",
+        ] {
+            sqlx::query(stmt).bind(&repo_id).execute(&mut *tx).await?;
+        }
+
+        sqlx::query(&format!("INSERT OR IGNORE INTO owned_ids {OWNED_DECISIONS}"))
+            .bind(&repo_id)
+            .bind(&repo_id)
+            .execute(&mut *tx)
+            .await?;
+
+        sqlx::query(&format!(
+            "INSERT OR IGNORE INTO owned_ids \
+             SELECT id FROM constraints WHERE decision_id IN ({OWNED_DECISIONS})"
+        ))
+        .bind(&repo_id)
+        .bind(&repo_id)
+        .execute(&mut *tx)
+        .await?;
+
+        // ----- edges first, while their endpoints still exist -----
+        //
+        // Episode fact edges carry free-text endpoints (`fact_subject` /
+        // `fact_object`) that match no id, so they are scoped by the episode
+        // recorded in `evidence_refs` instead.
+        sqlx::query(
+            "DELETE FROM temporal_edges \
+             WHERE source_id IN (SELECT id FROM owned_ids) \
+                OR target_id IN (SELECT id FROM owned_ids) \
+                OR EXISTS (SELECT 1 FROM episodes e \
+                           WHERE e.repo_id = ? \
+                             AND temporal_edges.evidence_refs LIKE '%' || e.id || '%')",
+        )
+        .bind(&repo_id)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query("DROP TABLE owned_ids")
+            .execute(&mut *tx)
+            .await?;
+
+        // ----- claims and evidence (Phase 4) -----
+        sqlx::query(
+            "DELETE FROM evidence_verifications WHERE anchor_id IN \
+             (SELECT id FROM evidence_anchors WHERE repo_id = ?)",
+        )
+        .bind(&repo_id)
+        .execute(&mut *tx)
+        .await?;
+
+        for stmt in [
+            "DELETE FROM evidence_anchors WHERE repo_id = ?",
+            "DELETE FROM claims WHERE repo_id = ?",
+            "DELETE FROM file_imports WHERE repo_id = ?",
+            "DELETE FROM index_lanes WHERE repo_id = ?",
+            "DELETE FROM freshness_manifests WHERE repo_id = ?",
+        ] {
+            sqlx::query(stmt).bind(&repo_id).execute(&mut *tx).await?;
+        }
+
         // ----- leaf tables (no dependents) first -----
 
         // commit_files → commits
@@ -127,44 +214,24 @@ impl SqliteStore {
             .execute(&mut *tx)
             .await?;
 
-        // constraints → decisions → adr_documents
-        sqlx::query(
-            "DELETE FROM constraints WHERE decision_id IN \
-             (SELECT d.id FROM decisions d \
-              JOIN adr_documents a ON a.id = d.adr_id \
-              WHERE a.repo_id = ?)",
-        )
-        .bind(&repo_id)
-        .execute(&mut *tx)
-        .await?;
+        // constraints, code links, and git links, for both decision sources
+        for stmt in [
+            "DELETE FROM constraints WHERE decision_id IN",
+            "DELETE FROM decision_code_links WHERE decision_id IN",
+            "DELETE FROM decision_git_links WHERE decision_id IN",
+        ] {
+            sqlx::query(&format!("{stmt} ({OWNED_DECISIONS})"))
+                .bind(&repo_id)
+                .bind(&repo_id)
+                .execute(&mut *tx)
+                .await?;
+        }
 
-        // decision_code_links
-        sqlx::query(
-            "DELETE FROM decision_code_links WHERE decision_id IN \
-             (SELECT d.id FROM decisions d \
-              JOIN adr_documents a ON a.id = d.adr_id \
-              WHERE a.repo_id = ?)",
-        )
+        // decisions themselves (ADR-sourced and episode-sourced)
+        sqlx::query(&format!(
+            "DELETE FROM decisions WHERE id IN ({OWNED_DECISIONS})"
+        ))
         .bind(&repo_id)
-        .execute(&mut *tx)
-        .await?;
-
-        // decision_git_links
-        sqlx::query(
-            "DELETE FROM decision_git_links WHERE decision_id IN \
-             (SELECT d.id FROM decisions d \
-              JOIN adr_documents a ON a.id = d.adr_id \
-              WHERE a.repo_id = ?)",
-        )
-        .bind(&repo_id)
-        .execute(&mut *tx)
-        .await?;
-
-        // decisions
-        sqlx::query(
-            "DELETE FROM decisions WHERE adr_id IN \
-             (SELECT id FROM adr_documents WHERE repo_id = ?)",
-        )
         .bind(&repo_id)
         .execute(&mut *tx)
         .await?;
@@ -223,6 +290,12 @@ impl SqliteStore {
             .await?;
 
         sqlx::query("DELETE FROM pull_requests WHERE repo_id = ?")
+            .bind(&repo_id)
+            .execute(&mut *tx)
+            .await?;
+
+        // after decisions, which reference episodes
+        sqlx::query("DELETE FROM episodes WHERE repo_id = ?")
             .bind(&repo_id)
             .execute(&mut *tx)
             .await?;

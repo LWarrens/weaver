@@ -91,6 +91,20 @@ impl SqliteStore {
         Ok(())
     }
 
+    /// Persist a packed f32 embedding blob for a pull_request row.
+    pub async fn update_pull_request_embedding(
+        &self,
+        pr_id: &str,
+        embedding: &[u8],
+    ) -> Result<(), Error> {
+        sqlx::query("UPDATE pull_requests SET embedding = ? WHERE id = ?")
+            .bind(embedding)
+            .bind(pr_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// Persist a packed f32 embedding blob for an entity_node row.
     pub async fn update_entity_node_embedding(
         &self,
@@ -199,6 +213,40 @@ impl SqliteStore {
                 Ok((Uuid::parse_str(&id).map_err(|_| anyhow::anyhow!("invalid uuid in storage"))?, r.get("message")))
             })
             .collect()
+    }
+
+    /// Fetch all pull requests missing an embedding for a repository, as
+    /// `(id, text)` where `text` is the stored title and body. Used by embed_all.
+    ///
+    /// GitHub review bodies are folded into the text embedded at ingest time
+    /// (`sync_prs`) but are not persisted, so a backfilled PR embeds title and
+    /// body only.
+    pub async fn fetch_pull_requests_without_embeddings(
+        &self,
+        repo_id: Uuid,
+    ) -> Result<Vec<(String, String)>, Error> {
+        let rows = sqlx::query(
+            r#"SELECT id, title, body FROM pull_requests
+               WHERE repo_id = ? AND embedding IS NULL"#,
+        )
+        .bind(repo_id.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .iter()
+            .map(|r| {
+                let title: Option<String> = r.get("title");
+                let body: Option<String> = r.get("body");
+                let text = [title, body]
+                    .into_iter()
+                    .flatten()
+                    .filter(|s| !s.trim().is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                (r.get("id"), text)
+            })
+            .collect())
     }
 
     /// Fetch all symbols missing an embedding for a repository.

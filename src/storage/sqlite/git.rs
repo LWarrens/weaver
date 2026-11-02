@@ -16,6 +16,16 @@ use crate::error::Error;
 
 use super::*;
 
+/// Graph label for a pull request: `#123` when `pr_ref` is a PR number,
+/// otherwise the source branch name it was keyed by.
+fn pr_label(pr_ref: &str) -> String {
+    if !pr_ref.is_empty() && pr_ref.chars().all(|c| c.is_ascii_digit()) {
+        format!("#{pr_ref}")
+    } else {
+        pr_ref.to_string()
+    }
+}
+
 impl SqliteStore {
     // -----------------------------------------------------------------------
     // Commit ingestion
@@ -66,10 +76,109 @@ impl SqliteStore {
         Ok(row)
     }
 
-    /// Insert a decision–commit link. Ignores duplicates.
+    // -----------------------------------------------------------------------
+    // Pull request ingestion (REQ-032)
+    // -----------------------------------------------------------------------
+
+    /// Insert a pull request record. Returns true if inserted, false if it already
+    /// existed (idempotent on `(repo_id, pr_ref)`).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_pull_request(
+        &self,
+        repo_id: Uuid,
+        pr_ref: &str,
+        pr_number: Option<i64>,
+        title: Option<&str>,
+        body: Option<&str>,
+        merge_sha: Option<&str>,
+        author: Option<&str>,
+        state: Option<&str>,
+        url: Option<&str>,
+        enrichment: &str,
+        source_time: &str,
+        ingested_at: &str,
+    ) -> Result<bool, Error> {
+        let id = Uuid::new_v4().to_string();
+        let result = sqlx::query(
+            r#"INSERT OR IGNORE INTO pull_requests
+               (id, repo_id, pr_ref, pr_number, title, body, merge_sha, author, state, url,
+                enrichment, source_time, ingested_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+        )
+        .bind(&id)
+        .bind(repo_id.to_string())
+        .bind(pr_ref)
+        .bind(pr_number)
+        .bind(title)
+        .bind(body)
+        .bind(merge_sha)
+        .bind(author)
+        .bind(state)
+        .bind(url)
+        .bind(enrichment)
+        .bind(source_time)
+        .bind(ingested_at)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Fetch `(id, enrichment)` for an existing pull request by repo + ref, if present.
+    pub async fn find_pull_request_by_ref(
+        &self,
+        repo_id: Uuid,
+        pr_ref: &str,
+    ) -> Result<Option<(String, String)>, Error> {
+        let row = sqlx::query(
+            "SELECT id, enrichment FROM pull_requests WHERE repo_id = ? AND pr_ref = ? LIMIT 1",
+        )
+        .bind(repo_id.to_string())
+        .bind(pr_ref)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| (r.get("id"), r.get("enrichment"))))
+    }
+
+    /// Upgrade a git-derived pull request stub in place with GitHub API detail.
+    /// Sets `enrichment = 'github'` so a later run does not re-fetch it.
+    pub async fn update_pull_request_enrichment(
+        &self,
+        pr_id: &str,
+        title: Option<&str>,
+        body: Option<&str>,
+        author: Option<&str>,
+        state: Option<&str>,
+        url: Option<&str>,
+    ) -> Result<(), Error> {
+        sqlx::query(
+            r#"UPDATE pull_requests
+               SET title = COALESCE(?, title),
+                   body = COALESCE(?, body),
+                   author = COALESCE(?, author),
+                   state = COALESCE(?, state),
+                   url = COALESCE(?, url),
+                   enrichment = 'github'
+               WHERE id = ?"#,
+        )
+        .bind(title)
+        .bind(body)
+        .bind(author)
+        .bind(state)
+        .bind(url)
+        .bind(pr_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Insert a decision–git link. `ref_type` is `commit` or `pr`; `ref_id` is the
+    /// UUID of the corresponding record. Ignores duplicates.
+    #[allow(clippy::too_many_arguments)]
     pub async fn insert_decision_git_link(
         &self,
         decision_id: &str,
+        ref_type: &str,
         ref_id: &str,
         confidence: f64,
         valid_from: &str,
@@ -80,10 +189,11 @@ impl SqliteStore {
         sqlx::query(
             r#"INSERT OR IGNORE INTO decision_git_links
                (id, decision_id, ref_type, ref_id, link_source, confidence, valid_from, ingested_at)
-               VALUES (?, ?, 'commit', ?, ?, ?, ?, ?)"#,
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
         .bind(&id)
         .bind(decision_id)
+        .bind(ref_type)
         .bind(ref_id)
         .bind(link_source)
         .bind(confidence)
@@ -354,7 +464,8 @@ impl SqliteStore {
                LEFT JOIN adr_documents ad ON ad.id = d.adr_id
                LEFT JOIN episodes e ON e.id = d.episode_id
                JOIN commits c ON c.id = dgl.ref_id
-               WHERE (ad.repo_id = ? OR e.repo_id = ?)
+               WHERE dgl.ref_type = 'commit'
+                 AND (ad.repo_id = ? OR e.repo_id = ?)
                  AND dgl.valid_from <= ?
                  AND (dgl.valid_to IS NULL OR dgl.valid_to > ?)
                ORDER BY dgl.confidence DESC, dgl.valid_from DESC
@@ -391,6 +502,101 @@ impl SqliteStore {
                     cross_file: false,
                 });
             }
+        }
+
+        // Pull requests linked to decisions (ref_type = 'pr').
+        let pr_link_rows = sqlx::query(
+            r#"SELECT dgl.id AS link_id, dgl.decision_id AS decision_id, p.id AS pr_id,
+                      p.pr_ref AS pr_ref, p.title AS title, dgl.confidence AS confidence
+               FROM decision_git_links dgl
+               JOIN decisions d ON d.id = dgl.decision_id
+               LEFT JOIN adr_documents ad ON ad.id = d.adr_id
+               LEFT JOIN episodes e ON e.id = d.episode_id
+               JOIN pull_requests p ON p.id = dgl.ref_id
+               WHERE dgl.ref_type = 'pr'
+                 AND (ad.repo_id = ? OR e.repo_id = ?)
+                 AND dgl.valid_from <= ?
+                 AND (dgl.valid_to IS NULL OR dgl.valid_to > ?)
+               ORDER BY dgl.confidence DESC, dgl.valid_from DESC
+               LIMIT ?"#,
+        )
+        .bind(repo_id.to_string())
+        .bind(repo_id.to_string())
+        .bind(valid_at)
+        .bind(valid_at)
+        .bind(edge_limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        for row in pr_link_rows {
+            let id: String = row.get("link_id");
+            let decision_id: String = row.get("decision_id");
+            let pr_id: String = row.get("pr_id");
+            let pr_ref: String = row.get("pr_ref");
+            let title: Option<String> = row.get("title");
+            let confidence: f64 = row.get("confidence");
+            upsert_node(GraphNodeRow {
+                id: pr_id.clone(),
+                kind: "pull_request".to_string(),
+                label: pr_label(&pr_ref),
+                detail: title,
+            });
+            if within_budget(edges.len(), max_edges) {
+                edges.push(GraphEdgeRow {
+                    id,
+                    source: decision_id,
+                    target: pr_id,
+                    edge_type: "references_pr".to_string(),
+                    confidence,
+                    cross_file: false,
+                });
+            }
+        }
+
+        // Standalone pull requests: visible regardless of decision links, joined to
+        // the merge/squash commit they landed as.
+        let pr_commit_rows = sqlx::query(
+            r#"SELECT p.id AS pr_id, p.pr_ref AS pr_ref, p.title AS title,
+                      c.id AS commit_id, c.sha AS sha, c.message AS message
+               FROM pull_requests p
+               JOIN commits c ON c.repo_id = p.repo_id AND c.sha = p.merge_sha
+               WHERE p.repo_id = ?
+               ORDER BY p.source_time DESC
+               LIMIT ?"#,
+        )
+        .bind(repo_id.to_string())
+        .bind(node_limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        for row in pr_commit_rows {
+            let pr_id: String = row.get("pr_id");
+            let pr_ref: String = row.get("pr_ref");
+            let title: Option<String> = row.get("title");
+            let commit_id: String = row.get("commit_id");
+            let sha: String = row.get("sha");
+            let message: Option<String> = row.get("message");
+            upsert_node(GraphNodeRow {
+                id: pr_id.clone(),
+                kind: "pull_request".to_string(),
+                label: pr_label(&pr_ref),
+                detail: title,
+            });
+            upsert_node(GraphNodeRow {
+                id: commit_id.clone(),
+                kind: "commit".to_string(),
+                label: sha.chars().take(8).collect(),
+                detail: message,
+            });
+            // structural edge: always include, like `modifies`
+            edges.push(GraphEdgeRow {
+                id: format!("includes:{}:{}", pr_id, commit_id),
+                source: pr_id,
+                target: commit_id,
+                edge_type: "includes".to_string(),
+                confidence: 1.0,
+                cross_file: false,
+            });
         }
 
         // Standalone commits: visible regardless of whether they have decision links

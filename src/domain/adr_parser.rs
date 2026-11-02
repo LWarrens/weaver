@@ -214,7 +214,12 @@ pub fn parse(source: &str, filename_stem: &str) -> ParsedAdr {
     }
     if !consequences_buf.is_empty() {
         adr.consequences = Some(consequences_buf.trim().to_string());
-        extract_constraints_from_text(&consequences_buf, 0.65, "Consequences", &mut adr.constraints);
+        extract_constraints_from_text(
+            &consequences_buf,
+            0.65,
+            "Consequences",
+            &mut adr.constraints,
+        );
         extract_file_mentions(&consequences_buf, &mut adr.file_mentions);
     }
     if !links_buf.is_empty() {
@@ -357,8 +362,13 @@ fn extract_status(text: &str) -> Option<AdrStatus> {
             _ => {}
         }
 
-        // Also match "Accepted" at start of line (MADR style: just the word)
-        let first_word = value.split_whitespace().next().unwrap_or("");
+        // Also match "Accepted" at start of line (MADR style: just the word),
+        // tolerating trailing punctuation like "Accepted." or "Accepted,".
+        let first_word = value
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .trim_end_matches(['.', ',', ';', ':']);
         match first_word {
             "accepted" | "approved" => return Some(AdrStatus::Accepted),
             "proposed" | "draft" => return Some(AdrStatus::Proposed),

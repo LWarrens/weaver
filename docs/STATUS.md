@@ -39,8 +39,10 @@ Changelog of what has landed, by phase. Overview and current capabilities are in
 - HTTP route detection via regex, stored in `routes` table, linked to handler symbols
  - `impact_of` — graph traversal from an ADR across `temporal_edges`
  - `sync_commits_from_git` — git commit ingestion and `decision_git_links` population; ingest-time embedding
+ - `sync_prs_from_git` — pull request ingestion derived from merge/squash commits, with optional GitHub API enrichment, `ref_type='pr'` decision links, PR-anchored claim evidence, and episode/fact mining from PR text
  - `adr_lineage` — supersession chain traversal via `supersession_edges`
  - `retract` — soft-delete hallucinated or incorrect LLM-extracted facts; cascade from decision to constraints; optional correction episode
+ - `dedup_decisions` — retroactively merge duplicate episode-sourced decisions that predate ingest-time dedup; dry run by default, stored embeddings only, ADR decisions only ever survive
  - `propose_links` — suggest candidate links (decisions, commits, symbols, routes) for an ADR with explicit confidence scores; never auto-promoted
  - `find_stale_decisions` — detect accepted decisions whose linked files or symbols have diverged from implementation reality; five heuristic staleness signals (including `drifted_evidence` from failed anchor verifications)
  - `trace_symbol_history` — reconstruct the full architectural timeline for a named symbol across decisions, constraints, commits, and episodes
@@ -56,7 +58,7 @@ Changelog of what has landed, by phase. Overview and current capabilities are in
 - Content-hash incremental skipping in `ingest_symbols`: unchanged files are skipped; changed files retire old symbols before re-inserting
 - Stale symbol retirement: symbols from renamed or deleted files have `valid_to` set rather than being left as ghost records
  - `synthesize_adr_leads` — observe and record undocumented patterns for orphaned files; context injection (co-changed files, semantic decision dedup); `observed_pattern` field; episode-backed provenance
- - `embed_all` extended: entity nodes pass added; all six passes run concurrently with `buffer_unordered(8)`; returns `entity_nodes_embedded`
+ - `embed_all` extended: entity nodes pass added; all passes run concurrently with `buffer_unordered(8)`; returns `entity_nodes_embedded`. A pull requests pass backfills PR embeddings and returns `pull_requests_embedded`; `index_status` reports pull request counts and embedding coverage; `get_graph_snapshot` includes `pull_request` nodes
  - Background jobs: `ingest_symbols` and `synthesize_adr_leads` return a `job_id` and stream progress; polled via `ingest_symbols_status` / `synthesize_adr_leads_status`; `cancel_ingest` stops a running ingest
  - `focused_file_brief` — one-call compact brief (exports, cross-file callers/callees, governing ADRs, recent commits) for a file or symbol
  - `list_repos` / `delete_repo` — repository inventory and irreversible per-repo purge

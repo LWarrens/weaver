@@ -1,5 +1,5 @@
 /// Raw call/import edge extracted from source text, before symbol resolution.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct RawEdge {
     /// Name of the calling symbol (or the source module for import edges).
     pub from_name: String,
@@ -8,6 +8,30 @@ pub struct RawEdge {
     /// Optional module/file specifier for imports (e.g. './foo', '../bar', 'foo/bar').
     pub to_file: Option<String>,
     pub edge_type: &'static str,
+    /// For a `calls` edge written as `recv.to_name(...)`, the leading identifier of
+    /// the receiver expression (e.g. `x` in `x.foo().bar()`). `None` for a bare call
+    /// `to_name(...)`. Used by the resolver to attempt receiver-type resolution.
+    pub recv: Option<String>,
+}
+
+/// A local `name -> type` binding observed inside one function body (or at module
+/// scope), used by the resolver to turn `x.method()` into a type-scoped lookup.
+#[derive(Debug, Clone)]
+pub struct RawBinding {
+    /// The enclosing function name, or `"__module__"` for module-scope bindings.
+    pub scope: String,
+    /// The bound variable / parameter name (`self` and `this` included).
+    pub var: String,
+    /// The inferred type name (already filtered of primitives/std wrappers).
+    pub type_name: String,
+}
+
+/// Everything one file's edge extractor produces: the edges plus the local
+/// type-binding context the resolver needs.
+#[derive(Debug, Clone, Default)]
+pub struct FileEdges {
+    pub edges: Vec<RawEdge>,
+    pub bindings: Vec<RawBinding>,
 }
 
 // ---------------------------------------------------------------------------
@@ -15,26 +39,53 @@ pub struct RawEdge {
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "tree-sitter-rust")]
-pub fn extract_rust_edges(source: &str) -> Vec<RawEdge> {
+pub fn extract_rust_edges(source: &str) -> FileEdges {
     use tree_sitter::Parser;
     use tree_sitter_rust::LANGUAGE;
 
     let mut parser = Parser::new();
     if parser.set_language(&LANGUAGE.into()).is_err() {
-        return vec![];
+        return FileEdges::default();
     }
 
     let tree = match parser.parse(source, None) {
         Some(t) => t,
-        None => return vec![],
+        None => return FileEdges::default(),
     };
 
     let bytes = source.as_bytes();
     let root = tree.root_node();
-    let mut edges = Vec::new();
+    let mut out = FileEdges::default();
 
-    collect_rust_edges(root, bytes, None, &mut edges);
-    edges
+    collect_rust_edges(root, bytes, None, None, &mut out);
+
+    out
+}
+
+/// Type name from a node that is either a bare `identifier`, a `type_identifier`,
+/// or a `scoped_identifier`/`scoped_type_identifier` path.
+#[cfg(feature = "tree-sitter-rust")]
+fn rust_ident_or_type(node: tree_sitter::Node, bytes: &[u8]) -> Option<String> {
+    match node.kind() {
+        "identifier" | "type_identifier" => node.utf8_text(bytes).ok().map(str::to_string),
+        _ => rust_type_names(node, bytes).into_iter().next(),
+    }
+}
+
+/// Leading identifier of a Rust receiver expression (`x` in `x.foo().bar()`),
+/// or `Some("self")` for a `self`-rooted chain.
+#[cfg(feature = "tree-sitter-rust")]
+fn rust_recv_ident(node: tree_sitter::Node, bytes: &[u8]) -> Option<String> {
+    match node.kind() {
+        "identifier" | "self" => node.utf8_text(bytes).ok().map(str::to_string),
+        "field_expression" | "call_expression" | "reference_expression"
+        | "try_expression" | "await_expression" | "unary_expression"
+        | "parenthesized_expression" => node
+            .child_by_field_name("value")
+            .or_else(|| node.named_child(0))
+            .and_then(|n| rust_recv_ident(n, bytes)),
+        _ => None,
+    }
 }
 
 #[cfg(feature = "tree-sitter-rust")]
@@ -79,9 +130,21 @@ fn collect_rust_edges(
     node: tree_sitter::Node,
     bytes: &[u8],
     enclosing_fn: Option<&str>,
-    edges: &mut Vec<RawEdge>,
+    enclosing_impl: Option<&str>,
+    out: &mut FileEdges,
 ) {
     let kind = node.kind();
+
+    // Track the type name of the enclosing `impl` block so `self.method()` calls
+    // can be resolved against it.
+    let impl_type: Option<String> = if kind == "impl_item" {
+        node.child_by_field_name("type")
+            .map(|t| rust_type_names(t, bytes))
+            .and_then(|v| v.into_iter().next())
+    } else {
+        None
+    };
+    let current_impl = impl_type.as_deref().or(enclosing_impl);
 
     let is_fn = matches!(kind, "function_item" | "function_signature_item");
     let fn_name: Option<String> = if is_fn {
@@ -95,14 +158,35 @@ fn collect_rust_edges(
 
     if is_fn {
         if let Some(fname) = fn_name.as_deref() {
+            // `self` resolves to the enclosing impl type.
+            if let Some(ity) = current_impl {
+                out.bindings.push(RawBinding {
+                    scope: fname.to_string(),
+                    var: "self".to_string(),
+                    type_name: ity.to_string(),
+                });
+            }
             let mut seen = std::collections::HashSet::new();
             if let Some(params) = node.child_by_field_name("parameters") {
                 let mut cursor = params.walk();
                 for param in params.named_children(&mut cursor) {
                     if let Some(type_node) = param.child_by_field_name("type") {
-                        for tname in rust_type_names(type_node, bytes) {
+                        let ptypes = rust_type_names(type_node, bytes);
+                        if let (Some(pat), Some(first)) = (
+                            param.child_by_field_name("pattern"),
+                            ptypes.first(),
+                        ) {
+                            if let Ok(vname) = pat.utf8_text(bytes) {
+                                out.bindings.push(RawBinding {
+                                    scope: fname.to_string(),
+                                    var: vname.to_string(),
+                                    type_name: first.clone(),
+                                });
+                            }
+                        }
+                        for tname in ptypes {
                             if seen.insert(tname.clone()) {
-                                edges.push(RawEdge { from_name: fname.to_string(), to_name: tname, to_file: None, edge_type: "uses_type" });
+                                out.edges.push(RawEdge { from_name: fname.to_string(), to_name: tname, to_file: None, edge_type: "uses_type", recv: None });
                             }
                         }
                     }
@@ -111,25 +195,70 @@ fn collect_rust_edges(
             if let Some(ret) = node.child_by_field_name("return_type") {
                 for tname in rust_type_names(ret, bytes) {
                     if seen.insert(tname.clone()) {
-                        edges.push(RawEdge { from_name: fname.to_string(), to_name: tname, to_file: None, edge_type: "uses_type" });
+                        out.edges.push(RawEdge { from_name: fname.to_string(), to_name: tname, to_file: None, edge_type: "uses_type", recv: None });
                     }
                 }
             }
         }
     }
 
-    if kind == "call_expression" {
+    if kind == "let_declaration" {
+        // `let x: T = ...;` and `let x = T::new(...);` — record a local binding.
+        if let (Some(scope), Some(pat)) = (current_fn, node.child_by_field_name("pattern")) {
+            if let Ok(vname) = pat.utf8_text(bytes) {
+                let ty = node
+                    .child_by_field_name("type")
+                    .map(|t| rust_type_names(t, bytes))
+                    .and_then(|v| v.into_iter().next())
+                    .or_else(|| {
+                        // RHS `Type::new(...)` / `Type { .. }`
+                        let val = node.child_by_field_name("value")?;
+                        match val.kind() {
+                            "call_expression" => {
+                                let f = val.child_by_field_name("function").or_else(|| val.child(0))?;
+                                if f.kind() == "scoped_identifier" {
+                                    let p = f.child_by_field_name("path")?;
+                                    rust_ident_or_type(p, bytes)
+                                } else {
+                                    None
+                                }
+                            }
+                            "struct_expression" => val
+                                .child_by_field_name("name")
+                                .and_then(|n| rust_ident_or_type(n, bytes)),
+                            _ => None,
+                        }
+                    });
+                if let Some(type_name) = ty {
+                    out.bindings.push(RawBinding {
+                        scope: scope.to_string(),
+                        var: vname.to_string(),
+                        type_name,
+                    });
+                }
+            }
+        }
+    } else if kind == "call_expression" {
         if let Some(caller) = enclosing_fn {
-            let callee = node
-                .child(0)
+            let target = node.child(0);
+            let callee = target
                 .and_then(|n| call_target_name(n, bytes))
                 .unwrap_or_default();
+            let recv = target.and_then(|n| {
+                if n.kind() == "field_expression" {
+                    n.child_by_field_name("value")
+                        .and_then(|v| rust_recv_ident(v, bytes))
+                } else {
+                    None
+                }
+            });
             if !callee.is_empty() && callee != caller {
-                edges.push(RawEdge {
+                out.edges.push(RawEdge {
                     from_name: caller.to_string(),
                     to_name: callee,
                     to_file: None,
                     edge_type: "calls",
+                    recv,
                 });
             }
         }
@@ -140,11 +269,12 @@ fn collect_rust_edges(
                 .and_then(|n| use_path_leaf(n, bytes))
                 .unwrap_or_default();
             if !target.is_empty() {
-                edges.push(RawEdge {
+                out.edges.push(RawEdge {
                     from_name: caller.to_string(),
                     to_name: target,
                     to_file: None,
                     edge_type: "imports",
+                    recv: None,
                 });
             }
         }
@@ -153,7 +283,7 @@ fn collect_rust_edges(
     let mut cursor = node.walk();
     let children: Vec<_> = node.named_children(&mut cursor).collect();
     for child in children {
-        collect_rust_edges(child, bytes, current_fn, edges);
+        collect_rust_edges(child, bytes, current_fn, current_impl, out);
     }
 }
 
@@ -198,9 +328,19 @@ pub(crate) fn collect_ts_edges(
     node: tree_sitter::Node,
     bytes: &[u8],
     enclosing_fn: Option<&str>,
-    edges: &mut Vec<RawEdge>,
+    enclosing_class: Option<&str>,
+    out: &mut FileEdges,
 ) {
     let kind = node.kind();
+
+    let class_name: Option<String> = if matches!(kind, "class_declaration" | "class") {
+        node.child_by_field_name("name")
+            .and_then(|n| n.utf8_text(bytes).ok())
+            .map(str::to_string)
+    } else {
+        None
+    };
+    let current_class = class_name.as_deref().or(enclosing_class);
 
     let is_fn = matches!(
         kind,
@@ -220,6 +360,13 @@ pub(crate) fn collect_ts_edges(
 
     if is_fn {
         if let Some(fname) = fn_name.as_deref() {
+            if let Some(cls) = current_class {
+                out.bindings.push(RawBinding {
+                    scope: fname.to_string(),
+                    var: "this".to_string(),
+                    type_name: cls.to_string(),
+                });
+            }
             let mut seen = std::collections::HashSet::new();
             if let Some(params) = node.child_by_field_name("parameters") {
                 let mut cursor = params.walk();
@@ -227,9 +374,21 @@ pub(crate) fn collect_ts_edges(
                     if matches!(param.kind(), "required_parameter" | "optional_parameter") {
                         if let Some(type_ann) = param.child_by_field_name("type") {
                             if let Some(type_node) = type_ann.named_child(0) {
-                                for tname in ts_type_names(type_node, bytes) {
+                                let ptypes = ts_type_names(type_node, bytes);
+                                if let (Some(pat), Some(first)) =
+                                    (param.child_by_field_name("pattern"), ptypes.first())
+                                {
+                                    if let Ok(vname) = pat.utf8_text(bytes) {
+                                        out.bindings.push(RawBinding {
+                                            scope: fname.to_string(),
+                                            var: vname.to_string(),
+                                            type_name: first.clone(),
+                                        });
+                                    }
+                                }
+                                for tname in ptypes {
                                     if seen.insert(tname.clone()) {
-                                        edges.push(RawEdge { from_name: fname.to_string(), to_name: tname, to_file: None, edge_type: "uses_type" });
+                                        out.edges.push(RawEdge { from_name: fname.to_string(), to_name: tname, to_file: None, edge_type: "uses_type", recv: None });
                                     }
                                 }
                             }
@@ -241,7 +400,7 @@ pub(crate) fn collect_ts_edges(
                 if let Some(type_node) = ret_ann.named_child(0) {
                     for tname in ts_type_names(type_node, bytes) {
                         if seen.insert(tname.clone()) {
-                            edges.push(RawEdge { from_name: fname.to_string(), to_name: tname, to_file: None, edge_type: "uses_type" });
+                            out.edges.push(RawEdge { from_name: fname.to_string(), to_name: tname, to_file: None, edge_type: "uses_type", recv: None });
                         }
                     }
                 }
@@ -249,18 +408,59 @@ pub(crate) fn collect_ts_edges(
         }
     }
 
-    if kind == "call_expression" {
+    if kind == "variable_declarator" {
+        // `const x: T = ...` / `const x = new T(...)`
+        if let (Some(scope), Some(name_node)) =
+            (current_fn.or(Some("__module__")), node.child_by_field_name("name"))
+        {
+            if let Ok(vname) = name_node.utf8_text(bytes) {
+                let ty = node
+                    .child_by_field_name("type")
+                    .and_then(|t| t.named_child(0))
+                    .map(|t| ts_type_names(t, bytes))
+                    .and_then(|v| v.into_iter().next())
+                    .or_else(|| {
+                        let val = node.child_by_field_name("value")?;
+                        if val.kind() == "new_expression" {
+                            val.child_by_field_name("constructor")
+                                .and_then(|c| c.utf8_text(bytes).ok())
+                                .map(str::to_string)
+                        } else {
+                            None
+                        }
+                    });
+                if let Some(type_name) = ty {
+                    out.bindings.push(RawBinding {
+                        scope: scope.to_string(),
+                        var: vname.to_string(),
+                        type_name,
+                    });
+                }
+            }
+        }
+    } else if kind == "call_expression" {
         if let Some(caller) = enclosing_fn {
-            let callee = node
-                .child_by_field_name("function")
+            let func = node.child_by_field_name("function");
+            let callee = func
                 .and_then(|n| ts_call_target(n, bytes))
                 .unwrap_or_default();
+            let recv = func.and_then(|n| {
+                if n.kind() == "member_expression" {
+                    n.child_by_field_name("object").and_then(|o| match o.kind() {
+                        "identifier" | "this" => o.utf8_text(bytes).ok().map(str::to_string),
+                        _ => None,
+                    })
+                } else {
+                    None
+                }
+            });
             if !callee.is_empty() && callee != caller {
-                edges.push(RawEdge {
+                out.edges.push(RawEdge {
                     from_name: caller.to_string(),
                     to_name: callee,
                     to_file: None,
                     edge_type: "calls",
+                    recv,
                 });
             }
         }
@@ -280,7 +480,7 @@ pub(crate) fn collect_ts_edges(
         let mut cursor = node.walk();
         for child in node.named_children(&mut cursor) {
             if child.kind() == "import_clause" {
-                collect_ts_import_clause(child, bytes, caller, module_spec.as_deref(), edges);
+                collect_ts_import_clause(child, bytes, caller, module_spec.as_deref(), out);
             }
         }
     } else if kind == "class_declaration" {
@@ -292,7 +492,7 @@ pub(crate) fn collect_ts_edges(
                 let mut cursor = heritage.walk();
                 for clause in heritage.named_children(&mut cursor) {
                     if clause.kind() == "class_heritage" {
-                        collect_ts_heritage(clause, bytes, class_name, edges);
+                        collect_ts_heritage(clause, bytes, class_name, out);
                     }
                 }
             }
@@ -302,7 +502,7 @@ pub(crate) fn collect_ts_edges(
     let mut cursor = node.walk();
     let children: Vec<_> = node.named_children(&mut cursor).collect();
     for child in children {
-        collect_ts_edges(child, bytes, current_fn, edges);
+        collect_ts_edges(child, bytes, current_fn, current_class, out);
     }
 }
 
@@ -355,18 +555,19 @@ fn collect_ts_import_clause(
     bytes: &[u8],
     caller: &str,
     module_spec: Option<&str>,
-    edges: &mut Vec<RawEdge>,
+    out: &mut FileEdges,
 ) {
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         match child.kind() {
             "identifier" => {
                 if let Ok(name) = child.utf8_text(bytes) {
-                    edges.push(RawEdge {
+                    out.edges.push(RawEdge {
                         from_name: caller.to_string(),
                         to_name: name.to_string(),
                         to_file: module_spec.map(|s| s.to_string()),
                         edge_type: "imports",
+                        recv: None,
                     });
                 }
             }
@@ -379,11 +580,12 @@ fn collect_ts_import_clause(
                             .and_then(|n| n.utf8_text(bytes).ok())
                             .unwrap_or_default();
                         if !name.is_empty() {
-                            edges.push(RawEdge {
+                            out.edges.push(RawEdge {
                                 from_name: caller.to_string(),
                                 to_name: name.to_string(),
                                 to_file: module_spec.map(|s| s.to_string()),
                                 edge_type: "imports",
+                                recv: None,
                             });
                         }
                     }
@@ -399,16 +601,17 @@ fn collect_ts_heritage(
     node: tree_sitter::Node,
     bytes: &[u8],
     class_name: &str,
-    edges: &mut Vec<RawEdge>,
+    out: &mut FileEdges,
 ) {
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         if let Ok(base) = child.utf8_text(bytes) {
-            edges.push(RawEdge {
+            out.edges.push(RawEdge {
                 from_name: class_name.to_string(),
                 to_name: base.to_string(),
                 to_file: None,
                 edge_type: "inherits",
+                recv: None,
             });
         }
     }
@@ -419,22 +622,22 @@ fn collect_ts_heritage(
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "tree-sitter-typescript")]
-pub fn extract_typescript_edges(source: &str) -> Vec<RawEdge> {
+pub fn extract_typescript_edges(source: &str) -> FileEdges {
     use tree_sitter::Parser;
     use tree_sitter_typescript::LANGUAGE_TYPESCRIPT;
 
     let mut parser = Parser::new();
     if parser.set_language(&LANGUAGE_TYPESCRIPT.into()).is_err() {
-        return vec![];
+        return FileEdges::default();
     }
     let tree = match parser.parse(source, None) {
         Some(t) => t,
-        None => return vec![],
+        None => return FileEdges::default(),
     };
     let bytes = source.as_bytes();
-    let mut edges = Vec::new();
-    collect_ts_edges(tree.root_node(), bytes, None, &mut edges);
-    edges
+    let mut out = FileEdges::default();
+    collect_ts_edges(tree.root_node(), bytes, None, None, &mut out);
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -442,22 +645,22 @@ pub fn extract_typescript_edges(source: &str) -> Vec<RawEdge> {
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "tree-sitter-javascript")]
-pub fn extract_javascript_edges(source: &str) -> Vec<RawEdge> {
+pub fn extract_javascript_edges(source: &str) -> FileEdges {
     use tree_sitter::Parser;
     use tree_sitter_javascript::LANGUAGE;
 
     let mut parser = Parser::new();
     if parser.set_language(&LANGUAGE.into()).is_err() {
-        return vec![];
+        return FileEdges::default();
     }
     let tree = match parser.parse(source, None) {
         Some(t) => t,
-        None => return vec![],
+        None => return FileEdges::default(),
     };
     let bytes = source.as_bytes();
-    let mut edges = Vec::new();
-    collect_ts_edges(tree.root_node(), bytes, None, &mut edges);
-    edges
+    let mut out = FileEdges::default();
+    collect_ts_edges(tree.root_node(), bytes, None, None, &mut out);
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -494,8 +697,8 @@ fn python_type_names(node: tree_sitter::Node, bytes: &[u8]) -> Vec<String> {
                 out.extend(python_type_names(sub, bytes));
             }
         }
-        "binary_operator" => {
-            // A | B (Python 3.10+ union)
+        "binary_operator" | "type" => {
+            // A | B (Python 3.10+ union), or a `type` wrapper node
             let mut cursor = node.walk();
             for child in node.named_children(&mut cursor) {
                 out.extend(python_type_names(child, bytes));
@@ -507,22 +710,22 @@ fn python_type_names(node: tree_sitter::Node, bytes: &[u8]) -> Vec<String> {
 }
 
 #[cfg(feature = "tree-sitter-python")]
-pub fn extract_python_edges(source: &str) -> Vec<RawEdge> {
+pub fn extract_python_edges(source: &str) -> FileEdges {
     use tree_sitter::Parser;
     use tree_sitter_python::LANGUAGE;
 
     let mut parser = Parser::new();
     if parser.set_language(&LANGUAGE.into()).is_err() {
-        return vec![];
+        return FileEdges::default();
     }
     let tree = match parser.parse(source, None) {
         Some(t) => t,
-        None => return vec![],
+        None => return FileEdges::default(),
     };
     let bytes = source.as_bytes();
-    let mut edges = Vec::new();
-    collect_python_edges(tree.root_node(), bytes, None, &mut edges);
-    edges
+    let mut out = FileEdges::default();
+    collect_python_edges(tree.root_node(), bytes, None, None, &mut out);
+    out
 }
 
 #[cfg(feature = "tree-sitter-python")]
@@ -530,9 +733,19 @@ fn collect_python_edges(
     node: tree_sitter::Node,
     bytes: &[u8],
     enclosing_fn: Option<&str>,
-    edges: &mut Vec<RawEdge>,
+    enclosing_class: Option<&str>,
+    out: &mut FileEdges,
 ) {
     let kind = node.kind();
+
+    let class_name: Option<String> = if kind == "class_definition" {
+        node.child_by_field_name("name")
+            .and_then(|n| n.utf8_text(bytes).ok())
+            .map(str::to_string)
+    } else {
+        None
+    };
+    let current_class = class_name.as_deref().or(enclosing_class);
 
     let is_fn = matches!(kind, "function_definition" | "async_function_definition");
     let fn_name: Option<String> = if is_fn {
@@ -546,6 +759,13 @@ fn collect_python_edges(
 
     if is_fn {
         if let Some(fname) = fn_name.as_deref() {
+            if let Some(cls) = current_class {
+                out.bindings.push(RawBinding {
+                    scope: fname.to_string(),
+                    var: "self".to_string(),
+                    type_name: cls.to_string(),
+                });
+            }
             let mut seen = std::collections::HashSet::new();
             if let Some(params) = node.child_by_field_name("parameters") {
                 let mut cursor = params.walk();
@@ -553,9 +773,21 @@ fn collect_python_edges(
                     if param.kind() == "typed_parameter" {
                         // named_child(0) = name, named_child(1) = type expression
                         if let Some(type_node) = param.named_child(1) {
-                            for tname in python_type_names(type_node, bytes) {
+                            let ptypes = python_type_names(type_node, bytes);
+                            if let (Some(nm), Some(first)) =
+                                (param.named_child(0), ptypes.first())
+                            {
+                                if let Ok(vname) = nm.utf8_text(bytes) {
+                                    out.bindings.push(RawBinding {
+                                        scope: fname.to_string(),
+                                        var: vname.to_string(),
+                                        type_name: first.clone(),
+                                    });
+                                }
+                            }
+                            for tname in ptypes {
                                 if seen.insert(tname.clone()) {
-                                    edges.push(RawEdge { from_name: fname.to_string(), to_name: tname, to_file: None, edge_type: "uses_type" });
+                                    out.edges.push(RawEdge { from_name: fname.to_string(), to_name: tname, to_file: None, edge_type: "uses_type", recv: None });
                                 }
                             }
                         }
@@ -565,7 +797,7 @@ fn collect_python_edges(
             if let Some(ret) = node.child_by_field_name("return_type") {
                 for tname in python_type_names(ret, bytes) {
                     if seen.insert(tname.clone()) {
-                        edges.push(RawEdge { from_name: fname.to_string(), to_name: tname, to_file: None, edge_type: "uses_type" });
+                        out.edges.push(RawEdge { from_name: fname.to_string(), to_name: tname, to_file: None, edge_type: "uses_type", recv: None });
                     }
                 }
             }
@@ -595,11 +827,12 @@ fn collect_python_edges(
                     _ => continue,
                 };
                 if !name.is_empty() {
-                    edges.push(RawEdge {
+                    out.edges.push(RawEdge {
                         from_name: "__module__".to_string(),
                         to_name: name,
                         to_file: Some(module_path),
                         edge_type: "imports",
+                        recv: None,
                     });
                 }
             }
@@ -623,11 +856,12 @@ fn collect_python_edges(
                                 let name =
                                     text.split('.').last().unwrap_or(text).to_string();
                                 if !name.is_empty() {
-                                    edges.push(RawEdge {
+                                    out.edges.push(RawEdge {
                                         from_name: "__module__".to_string(),
                                         to_name: name,
                                         to_file: Some(mpath.clone()),
                                         edge_type: "imports",
+                                        recv: None,
                                     });
                                 }
                             }
@@ -638,22 +872,24 @@ fn collect_python_edges(
                                     let name =
                                         text.split('.').last().unwrap_or(text).to_string();
                                     if !name.is_empty() {
-                                        edges.push(RawEdge {
+                                        out.edges.push(RawEdge {
                                             from_name: "__module__".to_string(),
                                             to_name: name,
                                             to_file: Some(mpath.clone()),
                                             edge_type: "imports",
+                                            recv: None,
                                         });
                                     }
                                 }
                             }
                         }
                         "wildcard_import" => {
-                            edges.push(RawEdge {
+                            out.edges.push(RawEdge {
                                 from_name: "__module__".to_string(),
                                 to_name: "*".to_string(),
                                 to_file: Some(mpath.clone()),
                                 edge_type: "imports",
+                                recv: None,
                             });
                         }
                         _ => {}
@@ -662,18 +898,66 @@ fn collect_python_edges(
             }
             return; // don't recurse into import nodes
         }
+        "assignment" => {
+            // `x = ClassName(...)` or `x: T = ...`
+            if let (Some(scope), Some(lhs)) =
+                (current_fn.or(Some("__module__")), node.child_by_field_name("left"))
+            {
+                if lhs.kind() == "identifier" {
+                    if let Ok(vname) = lhs.utf8_text(bytes) {
+                        let ty = node
+                            .child_by_field_name("type")
+                            .map(|t| python_type_names(t, bytes))
+                            .and_then(|v| v.into_iter().next())
+                            .or_else(|| {
+                                let rhs = node.child_by_field_name("right")?;
+                                if rhs.kind() == "call" {
+                                    let f = rhs.child_by_field_name("function")?;
+                                    let n = python_call_target(f, bytes)?;
+                                    // Heuristic: a capitalised callee is a constructor.
+                                    if n.chars().next().is_some_and(|c| c.is_uppercase()) {
+                                        Some(n)
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
+                                }
+                            });
+                        if let Some(type_name) = ty {
+                            out.bindings.push(RawBinding {
+                                scope: scope.to_string(),
+                                var: vname.to_string(),
+                                type_name,
+                            });
+                        }
+                    }
+                }
+            }
+        }
         "call" => {
             if let Some(caller) = current_fn {
-                let callee = node
-                    .child_by_field_name("function")
+                let func = node.child_by_field_name("function");
+                let callee = func
                     .and_then(|n| python_call_target(n, bytes))
                     .unwrap_or_default();
+                let recv = func.and_then(|n| {
+                    if n.kind() == "attribute" {
+                        n.child_by_field_name("object").and_then(|o| match o.kind() {
+                            "identifier" => o.utf8_text(bytes).ok().map(str::to_string),
+                            _ => None,
+                        })
+                    } else {
+                        None
+                    }
+                });
                 if !callee.is_empty() && callee != caller {
-                    edges.push(RawEdge {
+                    out.edges.push(RawEdge {
                         from_name: caller.to_string(),
                         to_name: callee,
                         to_file: None,
                         edge_type: "calls",
+                        recv,
                     });
                 }
             }
@@ -690,11 +974,12 @@ fn collect_python_edges(
                         if let Ok(text) = base.utf8_text(bytes) {
                             let name = text.split('.').last().unwrap_or(text).to_string();
                             if !name.is_empty() && name != cname.as_str() {
-                                edges.push(RawEdge {
+                                out.edges.push(RawEdge {
                                     from_name: cname.clone(),
                                     to_name: name,
                                     to_file: None,
                                     edge_type: "inherits",
+                                    recv: None,
                                 });
                             }
                         }
@@ -708,7 +993,7 @@ fn collect_python_edges(
     let mut cursor = node.walk();
     let children: Vec<_> = node.named_children(&mut cursor).collect();
     for child in children {
-        collect_python_edges(child, bytes, current_fn, edges);
+        collect_python_edges(child, bytes, current_fn, current_class, out);
     }
 }
 
@@ -756,22 +1041,22 @@ fn python_module_to_file_path(module_text: &str) -> String {
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "tree-sitter-go")]
-pub fn extract_go_edges(source: &str) -> Vec<RawEdge> {
+pub fn extract_go_edges(source: &str) -> FileEdges {
     use tree_sitter::Parser;
     use tree_sitter_go::LANGUAGE;
 
     let mut parser = Parser::new();
     if parser.set_language(&LANGUAGE.into()).is_err() {
-        return vec![];
+        return FileEdges::default();
     }
     let tree = match parser.parse(source, None) {
         Some(t) => t,
-        None => return vec![],
+        None => return FileEdges::default(),
     };
     let bytes = source.as_bytes();
-    let mut edges = Vec::new();
-    collect_go_edges(tree.root_node(), bytes, None, &mut edges);
-    edges
+    let mut out = FileEdges::default();
+    collect_go_edges(tree.root_node(), bytes, None, &mut out);
+    out
 }
 
 #[cfg(feature = "tree-sitter-go")]
@@ -779,7 +1064,7 @@ fn collect_go_edges(
     node: tree_sitter::Node,
     bytes: &[u8],
     enclosing_fn: Option<&str>,
-    edges: &mut Vec<RawEdge>,
+    out: &mut FileEdges,
 ) {
     let kind = node.kind();
 
@@ -798,12 +1083,12 @@ fn collect_go_edges(
             let mut cursor = node.walk();
             for child in node.named_children(&mut cursor) {
                 match child.kind() {
-                    "import_spec" => go_emit_import_spec(child, bytes, edges),
+                    "import_spec" => go_emit_import_spec(child, bytes, out),
                     "import_spec_list" => {
                         let mut c2 = child.walk();
                         for spec in child.named_children(&mut c2) {
                             if spec.kind() == "import_spec" {
-                                go_emit_import_spec(spec, bytes, edges);
+                                go_emit_import_spec(spec, bytes, out);
                             }
                         }
                     }
@@ -819,11 +1104,12 @@ fn collect_go_edges(
                     .and_then(|n| go_call_target(n, bytes))
                     .unwrap_or_default();
                 if !callee.is_empty() && callee != caller {
-                    edges.push(RawEdge {
+                    out.edges.push(RawEdge {
                         from_name: caller.to_string(),
                         to_name: callee,
                         to_file: None,
                         edge_type: "calls",
+                        recv: None,
                     });
                 }
             }
@@ -834,12 +1120,12 @@ fn collect_go_edges(
     let mut cursor = node.walk();
     let children: Vec<_> = node.named_children(&mut cursor).collect();
     for child in children {
-        collect_go_edges(child, bytes, current_fn, edges);
+        collect_go_edges(child, bytes, current_fn, out);
     }
 }
 
 #[cfg(feature = "tree-sitter-go")]
-fn go_emit_import_spec(spec: tree_sitter::Node, bytes: &[u8], edges: &mut Vec<RawEdge>) {
+fn go_emit_import_spec(spec: tree_sitter::Node, bytes: &[u8], out: &mut FileEdges) {
     // path field is an interpreted_string_literal like `"github.com/user/pkg"`
     if let Some(path_node) = spec.child_by_field_name("path") {
         if let Ok(raw) = path_node.utf8_text(bytes) {
@@ -856,11 +1142,12 @@ fn go_emit_import_spec(spec: tree_sitter::Node, bytes: &[u8], edges: &mut Vec<Ra
                 .filter(|s| *s != "_" && *s != ".")
                 .map(str::to_string);
             let to_name = alias.unwrap_or(pkg_name);
-            edges.push(RawEdge {
+            out.edges.push(RawEdge {
                 from_name: "__module__".to_string(),
                 to_name,
                 to_file: None, // Go import paths are URL-style; path resolution needs module root
                 edge_type: "imports",
+                recv: None,
             });
         }
     }
@@ -883,22 +1170,22 @@ fn go_call_target(node: tree_sitter::Node, bytes: &[u8]) -> Option<String> {
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "tree-sitter-java")]
-pub fn extract_java_edges(source: &str) -> Vec<RawEdge> {
+pub fn extract_java_edges(source: &str) -> FileEdges {
     use tree_sitter::Parser;
     use tree_sitter_java::LANGUAGE;
 
     let mut parser = Parser::new();
     if parser.set_language(&LANGUAGE.into()).is_err() {
-        return vec![];
+        return FileEdges::default();
     }
     let tree = match parser.parse(source, None) {
         Some(t) => t,
-        None => return vec![],
+        None => return FileEdges::default(),
     };
     let bytes = source.as_bytes();
-    let mut edges = Vec::new();
-    collect_java_edges(tree.root_node(), bytes, None, &mut edges);
-    edges
+    let mut out = FileEdges::default();
+    collect_java_edges(tree.root_node(), bytes, None, &mut out);
+    out
 }
 
 #[cfg(feature = "tree-sitter-java")]
@@ -906,7 +1193,7 @@ fn collect_java_edges(
     node: tree_sitter::Node,
     bytes: &[u8],
     enclosing_fn: Option<&str>,
-    edges: &mut Vec<RawEdge>,
+    out: &mut FileEdges,
 ) {
     let kind = node.kind();
 
@@ -931,11 +1218,12 @@ fn collect_java_edges(
                     if !text.is_empty() {
                         let class_name = text.split('.').last().unwrap_or(text).to_string();
                         let file_path = text.replace('.', "/");
-                        edges.push(RawEdge {
+                        out.edges.push(RawEdge {
                             from_name: "__module__".to_string(),
                             to_name: class_name,
                             to_file: Some(file_path),
                             edge_type: "imports",
+                            recv: None,
                         });
                     }
                 }
@@ -950,11 +1238,12 @@ fn collect_java_edges(
                     .map(str::to_string)
                     .unwrap_or_default();
                 if !callee.is_empty() && callee != caller {
-                    edges.push(RawEdge {
+                    out.edges.push(RawEdge {
                         from_name: caller.to_string(),
                         to_name: callee,
                         to_file: None,
                         edge_type: "calls",
+                        recv: None,
                     });
                 }
             }
@@ -970,11 +1259,12 @@ fn collect_java_edges(
                     if let Ok(base) = superclass.utf8_text(bytes) {
                         let base = base.trim();
                         if !base.is_empty() {
-                            edges.push(RawEdge {
+                            out.edges.push(RawEdge {
                                 from_name: cname.clone(),
                                 to_name: base.to_string(),
                                 to_file: None,
                                 edge_type: "inherits",
+                                recv: None,
                             });
                         }
                     }
@@ -986,11 +1276,12 @@ fn collect_java_edges(
                         if let Ok(name) = iface.utf8_text(bytes) {
                             let name = name.trim();
                             if !name.is_empty() {
-                                edges.push(RawEdge {
+                                out.edges.push(RawEdge {
                                     from_name: cname.clone(),
                                     to_name: name.to_string(),
                                     to_file: None,
                                     edge_type: "implements",
+                                    recv: None,
                                 });
                             }
                         }
@@ -1004,7 +1295,7 @@ fn collect_java_edges(
     let mut cursor = node.walk();
     let children: Vec<_> = node.named_children(&mut cursor).collect();
     for child in children {
-        collect_java_edges(child, bytes, current_fn, edges);
+        collect_java_edges(child, bytes, current_fn, out);
     }
 }
 
@@ -1013,22 +1304,22 @@ fn collect_java_edges(
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "tree-sitter-c")]
-pub fn extract_c_edges(source: &str) -> Vec<RawEdge> {
+pub fn extract_c_edges(source: &str) -> FileEdges {
     use tree_sitter::Parser;
     use tree_sitter_c::LANGUAGE;
 
     let mut parser = Parser::new();
     if parser.set_language(&LANGUAGE.into()).is_err() {
-        return vec![];
+        return FileEdges::default();
     }
     let tree = match parser.parse(source, None) {
         Some(t) => t,
-        None => return vec![],
+        None => return FileEdges::default(),
     };
     let bytes = source.as_bytes();
-    let mut edges = Vec::new();
-    collect_c_edges(tree.root_node(), bytes, None, &mut edges);
-    edges
+    let mut out = FileEdges::default();
+    collect_c_edges(tree.root_node(), bytes, None, &mut out);
+    out
 }
 
 #[cfg(feature = "tree-sitter-c")]
@@ -1036,7 +1327,7 @@ fn collect_c_edges(
     node: tree_sitter::Node,
     bytes: &[u8],
     enclosing_fn: Option<&str>,
-    edges: &mut Vec<RawEdge>,
+    out: &mut FileEdges,
 ) {
     let kind = node.kind();
 
@@ -1063,11 +1354,12 @@ fn collect_c_edges(
                                 .and_then(|s| s.to_str())
                                 .unwrap_or(&path)
                                 .to_string();
-                            edges.push(RawEdge {
+                            out.edges.push(RawEdge {
                                 from_name: "__module__".to_string(),
                                 to_name: stem,
                                 to_file: Some(path),
                                 edge_type: "imports",
+                                recv: None,
                             });
                         }
                     }
@@ -1083,11 +1375,12 @@ fn collect_c_edges(
                     .map(|s| s.trim().to_string())
                     .unwrap_or_default();
                 if !callee.is_empty() && callee != caller {
-                    edges.push(RawEdge {
+                    out.edges.push(RawEdge {
                         from_name: caller.to_string(),
                         to_name: callee,
                         to_file: None,
                         edge_type: "calls",
+                        recv: None,
                     });
                 }
             }
@@ -1098,7 +1391,7 @@ fn collect_c_edges(
     let mut cursor = node.walk();
     let children: Vec<_> = node.named_children(&mut cursor).collect();
     for child in children {
-        collect_c_edges(child, bytes, current_fn, edges);
+        collect_c_edges(child, bytes, current_fn, out);
     }
 }
 
@@ -1132,22 +1425,22 @@ fn c_declarator_name(node: tree_sitter::Node, bytes: &[u8]) -> Option<String> {
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "tree-sitter-cpp")]
-pub fn extract_cpp_edges(source: &str) -> Vec<RawEdge> {
+pub fn extract_cpp_edges(source: &str) -> FileEdges {
     use tree_sitter::Parser;
     use tree_sitter_cpp::LANGUAGE;
 
     let mut parser = Parser::new();
     if parser.set_language(&LANGUAGE.into()).is_err() {
-        return vec![];
+        return FileEdges::default();
     }
     let tree = match parser.parse(source, None) {
         Some(t) => t,
-        None => return vec![],
+        None => return FileEdges::default(),
     };
     let bytes = source.as_bytes();
-    let mut edges = Vec::new();
-    collect_cpp_edges(tree.root_node(), bytes, None, &mut edges);
-    edges
+    let mut out = FileEdges::default();
+    collect_cpp_edges(tree.root_node(), bytes, None, &mut out);
+    out
 }
 
 #[cfg(feature = "tree-sitter-cpp")]
@@ -1155,7 +1448,7 @@ fn collect_cpp_edges(
     node: tree_sitter::Node,
     bytes: &[u8],
     enclosing_fn: Option<&str>,
-    edges: &mut Vec<RawEdge>,
+    out: &mut FileEdges,
 ) {
     let kind = node.kind();
 
@@ -1180,11 +1473,12 @@ fn collect_cpp_edges(
                                 .and_then(|s| s.to_str())
                                 .unwrap_or(&path)
                                 .to_string();
-                            edges.push(RawEdge {
+                            out.edges.push(RawEdge {
                                 from_name: "__module__".to_string(),
                                 to_name: stem,
                                 to_file: Some(path),
                                 edge_type: "imports",
+                                recv: None,
                             });
                         }
                     }
@@ -1206,11 +1500,12 @@ fn collect_cpp_edges(
                 .trim()
                 .to_string();
             if !name.is_empty() {
-                edges.push(RawEdge {
+                out.edges.push(RawEdge {
                     from_name: "__module__".to_string(),
                     to_name: name,
                     to_file: None,
                     edge_type: "imports",
+                    recv: None,
                 });
             }
             return;
@@ -1222,11 +1517,12 @@ fn collect_cpp_edges(
                     .and_then(|n| cpp_call_target(n, bytes))
                     .unwrap_or_default();
                 if !callee.is_empty() && callee != caller {
-                    edges.push(RawEdge {
+                    out.edges.push(RawEdge {
                         from_name: caller.to_string(),
                         to_name: callee,
                         to_file: None,
                         edge_type: "calls",
+                        recv: None,
                     });
                 }
             }
@@ -1254,11 +1550,12 @@ fn collect_cpp_edges(
                             .trim()
                             .to_string();
                         if !base_name.is_empty() && base_name != *cname {
-                            edges.push(RawEdge {
+                            out.edges.push(RawEdge {
                                 from_name: cname.clone(),
                                 to_name: base_name,
                                 to_file: None,
                                 edge_type: "inherits",
+                                recv: None,
                             });
                         }
                     }
@@ -1271,7 +1568,7 @@ fn collect_cpp_edges(
     let mut cursor = node.walk();
     let children: Vec<_> = node.named_children(&mut cursor).collect();
     for child in children {
-        collect_cpp_edges(child, bytes, current_fn, edges);
+        collect_cpp_edges(child, bytes, current_fn, out);
     }
 }
 
@@ -1296,22 +1593,22 @@ fn cpp_call_target(node: tree_sitter::Node, bytes: &[u8]) -> Option<String> {
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "tree-sitter-ruby")]
-pub fn extract_ruby_edges(source: &str) -> Vec<RawEdge> {
+pub fn extract_ruby_edges(source: &str) -> FileEdges {
     use tree_sitter::Parser;
     use tree_sitter_ruby::LANGUAGE;
 
     let mut parser = Parser::new();
     if parser.set_language(&LANGUAGE.into()).is_err() {
-        return vec![];
+        return FileEdges::default();
     }
     let tree = match parser.parse(source, None) {
         Some(t) => t,
-        None => return vec![],
+        None => return FileEdges::default(),
     };
     let bytes = source.as_bytes();
-    let mut edges = Vec::new();
-    collect_ruby_edges(tree.root_node(), bytes, None, &mut edges);
-    edges
+    let mut out = FileEdges::default();
+    collect_ruby_edges(tree.root_node(), bytes, None, &mut out);
+    out
 }
 
 #[cfg(feature = "tree-sitter-ruby")]
@@ -1319,7 +1616,7 @@ fn collect_ruby_edges(
     node: tree_sitter::Node,
     bytes: &[u8],
     enclosing_fn: Option<&str>,
-    edges: &mut Vec<RawEdge>,
+    out: &mut FileEdges,
 ) {
     let kind = node.kind();
 
@@ -1373,11 +1670,12 @@ fn collect_ruby_edges(
                                         .and_then(|s| s.to_str())
                                         .unwrap_or(&path)
                                         .to_string();
-                                    edges.push(RawEdge {
+                                    out.edges.push(RawEdge {
                                         from_name: "__module__".to_string(),
                                         to_name: name,
                                         to_file,
                                         edge_type: "imports",
+                                        recv: None,
                                     });
                                 }
                             }
@@ -1394,11 +1692,12 @@ fn collect_ruby_edges(
                             let name = name.trim().to_string();
                             if !name.is_empty() {
                                 let from = enclosing_fn.unwrap_or("__module__");
-                                edges.push(RawEdge {
+                                out.edges.push(RawEdge {
                                     from_name: from.to_string(),
                                     to_name: name,
                                     to_file: None,
                                     edge_type: "uses_type",
+                                    recv: None,
                                 });
                             }
                         }
@@ -1408,11 +1707,12 @@ fn collect_ruby_edges(
             callee if !callee.is_empty() => {
                 if let Some(caller) = current_fn {
                     if callee != caller {
-                        edges.push(RawEdge {
+                        out.edges.push(RawEdge {
                             from_name: caller.to_string(),
                             to_name: callee.to_string(),
                             to_file: None,
                             edge_type: "calls",
+                            recv: None,
                         });
                     }
                 }
@@ -1429,11 +1729,12 @@ fn collect_ruby_edges(
                 if let Ok(base) = superclass.utf8_text(bytes) {
                     let base = base.trim();
                     if !base.is_empty() {
-                        edges.push(RawEdge {
+                        out.edges.push(RawEdge {
                             from_name: cname.clone(),
                             to_name: base.to_string(),
                             to_file: None,
                             edge_type: "inherits",
+                            recv: None,
                         });
                     }
                 }
@@ -1444,7 +1745,7 @@ fn collect_ruby_edges(
     let mut cursor = node.walk();
     let children: Vec<_> = node.named_children(&mut cursor).collect();
     for child in children {
-        collect_ruby_edges(child, bytes, current_fn, edges);
+        collect_ruby_edges(child, bytes, current_fn, out);
     }
 }
 
@@ -1453,46 +1754,129 @@ fn collect_ruby_edges(
 // ---------------------------------------------------------------------------
 
 #[cfg(not(feature = "tree-sitter-rust"))]
-pub fn extract_rust_edges(_source: &str) -> Vec<RawEdge> {
-    vec![]
+pub fn extract_rust_edges(_source: &str) -> FileEdges {
+    FileEdges::default()
 }
 
 #[cfg(not(feature = "tree-sitter-typescript"))]
-pub fn extract_typescript_edges(_source: &str) -> Vec<RawEdge> {
-    vec![]
+pub fn extract_typescript_edges(_source: &str) -> FileEdges {
+    FileEdges::default()
 }
 
 #[cfg(not(feature = "tree-sitter-javascript"))]
-pub fn extract_javascript_edges(_source: &str) -> Vec<RawEdge> {
-    vec![]
+pub fn extract_javascript_edges(_source: &str) -> FileEdges {
+    FileEdges::default()
 }
 
 #[cfg(not(feature = "tree-sitter-python"))]
-pub fn extract_python_edges(_source: &str) -> Vec<RawEdge> {
-    vec![]
+pub fn extract_python_edges(_source: &str) -> FileEdges {
+    FileEdges::default()
 }
 
 #[cfg(not(feature = "tree-sitter-go"))]
-pub fn extract_go_edges(_source: &str) -> Vec<RawEdge> {
-    vec![]
+pub fn extract_go_edges(_source: &str) -> FileEdges {
+    FileEdges::default()
 }
 
 #[cfg(not(feature = "tree-sitter-java"))]
-pub fn extract_java_edges(_source: &str) -> Vec<RawEdge> {
-    vec![]
+pub fn extract_java_edges(_source: &str) -> FileEdges {
+    FileEdges::default()
 }
 
 #[cfg(not(feature = "tree-sitter-c"))]
-pub fn extract_c_edges(_source: &str) -> Vec<RawEdge> {
-    vec![]
+pub fn extract_c_edges(_source: &str) -> FileEdges {
+    FileEdges::default()
 }
 
 #[cfg(not(feature = "tree-sitter-cpp"))]
-pub fn extract_cpp_edges(_source: &str) -> Vec<RawEdge> {
-    vec![]
+pub fn extract_cpp_edges(_source: &str) -> FileEdges {
+    FileEdges::default()
 }
 
 #[cfg(not(feature = "tree-sitter-ruby"))]
-pub fn extract_ruby_edges(_source: &str) -> Vec<RawEdge> {
-    vec![]
+pub fn extract_ruby_edges(_source: &str) -> FileEdges {
+    FileEdges::default()
+}
+
+#[cfg(test)]
+mod recv_binding_tests {
+    use super::*;
+
+    fn call_recv(edges: &[RawEdge], to: &str) -> Option<String> {
+        edges
+            .iter()
+            .find(|e| e.edge_type == "calls" && e.to_name == to)
+            .and_then(|e| e.recv.clone())
+    }
+    fn binding<'a>(fe: &'a FileEdges, var: &str) -> Option<&'a str> {
+        fe.bindings
+            .iter()
+            .find(|b| b.var == var)
+            .map(|b| b.type_name.as_str())
+    }
+
+    #[cfg(feature = "tree-sitter-rust")]
+    #[test]
+    fn rust_captures_receiver_and_bindings() {
+        let src = r#"
+            struct Svc;
+            impl Svc {
+                fn run(&self, repo: Repo) {
+                    let store = Store::new();
+                    store.save();
+                    repo.load();
+                    self.tick();
+                }
+            }
+        "#;
+        let fe = extract_rust_edges(src);
+        assert_eq!(call_recv(&fe.edges, "save").as_deref(), Some("store"));
+        assert_eq!(call_recv(&fe.edges, "load").as_deref(), Some("repo"));
+        assert_eq!(call_recv(&fe.edges, "tick").as_deref(), Some("self"));
+        assert_eq!(binding(&fe, "store"), Some("Store"));
+        assert_eq!(binding(&fe, "repo"), Some("Repo"));
+        assert_eq!(binding(&fe, "self"), Some("Svc"));
+    }
+
+    #[cfg(feature = "tree-sitter-typescript")]
+    #[test]
+    fn ts_captures_receiver_and_bindings() {
+        let src = r#"
+            class Widget {
+                render(cfg: Config) {
+                    const svc = new Service();
+                    svc.start();
+                    cfg.apply();
+                    this.paint();
+                }
+            }
+        "#;
+        let fe = extract_typescript_edges(src);
+        assert_eq!(call_recv(&fe.edges, "start").as_deref(), Some("svc"));
+        assert_eq!(call_recv(&fe.edges, "apply").as_deref(), Some("cfg"));
+        assert_eq!(call_recv(&fe.edges, "paint").as_deref(), Some("this"));
+        assert_eq!(binding(&fe, "svc"), Some("Service"));
+        assert_eq!(binding(&fe, "cfg"), Some("Config"));
+        assert_eq!(binding(&fe, "this"), Some("Widget"));
+    }
+
+    #[cfg(feature = "tree-sitter-python")]
+    #[test]
+    fn python_captures_receiver_and_bindings() {
+        let src = concat!(
+            "class Widget:\n",
+            "    def render(self, cfg: Config):\n",
+            "        svc = Service()\n",
+            "        svc.start()\n",
+            "        cfg.apply()\n",
+            "        self.paint()\n",
+        );
+        let fe = extract_python_edges(src);
+        assert_eq!(call_recv(&fe.edges, "start").as_deref(), Some("svc"));
+        assert_eq!(call_recv(&fe.edges, "apply").as_deref(), Some("cfg"));
+        assert_eq!(call_recv(&fe.edges, "paint").as_deref(), Some("self"));
+        assert_eq!(binding(&fe, "svc"), Some("Service"));
+        assert_eq!(binding(&fe, "cfg"), Some("Config"));
+        assert_eq!(binding(&fe, "self"), Some("Widget"));
+    }
 }

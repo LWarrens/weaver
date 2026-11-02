@@ -84,6 +84,44 @@ impl SqliteStore {
         })
     }
 
+    /// Every open entity node that could stand for `entity_type` (typed as such,
+    /// or untyped), for fuzzy name matching done by the caller.
+    pub async fn list_open_entity_nodes(
+        &self,
+        repo_id: Uuid,
+        entity_type: &str,
+    ) -> Result<Vec<EntityNode>, Error> {
+        let rows = sqlx::query(
+            r#"SELECT id, canonical_name, entity_type, confidence,
+                      valid_from, valid_to, ingested_at, evidence_refs
+               FROM entity_nodes
+               WHERE repo_id = ? AND valid_to IS NULL
+                 AND (entity_type = ? OR entity_type IS NULL)"#,
+        )
+        .bind(repo_id.to_string())
+        .bind(entity_type)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|row| {
+                let evidence_refs_json: String = row.get("evidence_refs");
+                Ok(EntityNode {
+                    id: Uuid::parse_str(&row.get::<String, _>("id")).map_err(|_| {
+                        crate::error::Error::Other(anyhow::anyhow!("invalid UUID in entity_nodes"))
+                    })?,
+                    repo_id,
+                    canonical_name: row.get("canonical_name"),
+                    entity_type: row.get("entity_type"),
+                    confidence: row.get("confidence"),
+                    valid_from: row.get("valid_from"),
+                    valid_to: row.get("valid_to"),
+                    ingested_at: row.get("ingested_at"),
+                    evidence_refs: serde_json::from_str(&evidence_refs_json).unwrap_or_default(),
+                })
+            })
+            .collect()
+    }
+
     /// Current entity nodes matching a name, case-insensitively. When
     /// `entity_type` is given, untyped nodes also match — episode-created
     /// entities carry no type.

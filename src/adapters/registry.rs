@@ -1,9 +1,9 @@
-use crate::adapters::edges::{self, RawEdge};
+use crate::adapters::edges::{self, FileEdges};
 use crate::adapters::symbols;
 
 /// Dispatch edge extraction by file extension.
-/// Returns an empty vec if no extractor is registered for the extension.
-pub fn extract_edges_for_extension(ext: &str, source: &str) -> Vec<RawEdge> {
+/// Returns empty `FileEdges` if no extractor is registered for the extension.
+pub fn extract_edges_for_extension(ext: &str, source: &str) -> FileEdges {
     match ext.trim_start_matches('.').to_lowercase().as_str() {
         "rs" | "rust" => edges::extract_rust_edges(source),
         "ts" | "tsx" => edges::extract_typescript_edges(source),
@@ -14,7 +14,7 @@ pub fn extract_edges_for_extension(ext: &str, source: &str) -> Vec<RawEdge> {
         "c" | "h" => edges::extract_c_edges(source),
         "cpp" | "cc" | "cxx" | "hpp" | "hxx" => edges::extract_cpp_edges(source),
         "rb" => edges::extract_ruby_edges(source),
-        _ => vec![],
+        _ => FileEdges::default(),
     }
 }
 

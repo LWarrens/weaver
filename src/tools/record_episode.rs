@@ -603,14 +603,14 @@ async fn episode_decision_claim_id(
 // Decision dedup (entity resolution)
 // ---------------------------------------------------------------------------
 
-struct KnownDecision {
-    summary: DecisionSummary,
-    normalized: String,
-    embedding: Option<Vec<f32>>,
+pub(crate) struct KnownDecision {
+    pub(crate) summary: DecisionSummary,
+    pub(crate) normalized: String,
+    pub(crate) embedding: Option<Vec<f32>>,
 }
 
 /// Lowercase and collapse whitespace so trivially reformatted text matches.
-fn normalize_decision_text(s: &str) -> String {
+pub(crate) fn normalize_decision_text(s: &str) -> String {
     s.to_lowercase()
         .split_whitespace()
         .collect::<Vec<_>>()
@@ -620,7 +620,7 @@ fn normalize_decision_text(s: &str) -> String {
 /// Best duplicate among known decisions: a normalized-exact text match wins
 /// outright (similarity 1.0); otherwise the highest cosine similarity at or
 /// above `threshold` when both sides have embeddings.
-fn find_duplicate_decision(
+pub(crate) fn find_duplicate_decision(
     known: &[KnownDecision],
     normalized: &str,
     embedding: Option<&[f32]>,

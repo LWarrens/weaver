@@ -27,6 +27,8 @@ drifts from the implementation until the `docs/adr/` folder is archaeology. An a
 weaver keeps the three aligned, with SQLite as the bitemporal source of truth and every fact
 tagged with when it was true, when weaver learned it, and how confident it is.
 
+![Code (what exists), Git (what changed), and ADRs (why it was decided) feed weaver's bitemporal SQLite store, which tags every fact with when it was true, when it was learned, and how confident it is, and returns an answer plus its evidence and a freshness verdict checked against your working tree](docs/diagrams/three-truths.png)
+
 **An agent about to change your code.** Before it edits `orders/handler.rs`,
 `inspect_change_against_decisions` checks the change against active constraints and - by
 default - refuses to answer from evidence that has drifted, handing back the exact stale
@@ -77,6 +79,8 @@ be found again, or the claim was never anchored. `unprovable` is terminal, not "
 confidence." Under `verify: strict`, an in-scope stale claim populates `refused` with a
 rebuild obligation instead of returning a normal answer.
 
+![A claim carries an evidence_grade set at ingest; re-hashing its cited spans against the working tree resolves its disposition to unaffected (all citations hash clean), affected (stale citations relocated), or the terminal unprovable (a citation moved and was not found again, or was never anchored). unaffected and affected return a normal answer; an in-scope unprovable claim under verify strict is routed to refused with a rebuild obligation](docs/diagrams/claim-lifecycle.png)
+
 ## Quickstart
 
 ```bash
@@ -120,19 +124,21 @@ episodes are stored without extraction.
   Discussion is never silently upgraded to an accepted decision. LLM mistakes are `retract`-able
   with an audit trail.
 
+![query fans a text query out to three retrievers - keyword over SQLite FTS, semantic over embeddings, and graph BFS over typed temporal edges - and Reciprocal Rank Fusion merges their results into one ranked answer carrying decisions, constraints, evidence, and confidence, with the full retrieval provenance available via explain_answer](docs/diagrams/retrieval-fusion.png)
+
 ## Tools
 
-37 MCP tools, all returning strict JSON. Full request/response contracts:
+38 MCP tools, all returning strict JSON. Full request/response contracts:
 **[docs/TOOLS.md](docs/TOOLS.md)**.
 
 | Group | Tools |
 |---|---|
-| **Ingest** | `sync_adrs_from_git`, `ingest_symbols` (+ `_status`, `cancel_ingest`), `sync_commits_from_git`, `sync_incremental`, `record_decision_episode`, `embed_all` |
+| **Ingest** | `sync_adrs_from_git`, `ingest_symbols` (+ `_status`, `cancel_ingest`), `sync_commits_from_git`, `sync_prs_from_git`, `sync_incremental`, `record_decision_episode`, `embed_all` |
 | **Ask** | `query`, `find_decisions_for_code`, `get_architecture`, `focused_file_brief`, `trace_call_path`, `impact_of`, `explain_answer` |
 | **Verify** | `inspect_change_against_decisions`, `verify_claims`, `verify_index_integrity`, `find_stale_decisions`, `check_consistency`, `index_status`, `validate_adr` |
 | **History** | `trace_symbol_history`, `adr_lineage`, `diff_architecture` |
 | **Author** | `generate_adr_draft`, `generate_adr_patch`, `synthesize_adr_leads` (+ `_status`) |
-| **Curate** | `propose_links`, `retract`, `find_orphaned_code`, `list_repos`, `delete_repo` |
+| **Curate** | `propose_links`, `retract`, `dedup_decisions`, `find_orphaned_code`, `list_repos`, `delete_repo` |
 | **Schema / ops** | `get_graph_schema`, `get_graph_snapshot`, `reload_daemon` |
 
 ## The manager client
@@ -141,11 +147,6 @@ episodes are stored without extraction.
 Streamable HTTP endpoint. It renders the knowledge graph as a 3D force-directed view -
 decisions, files, symbols, commits, constraints, and observed-pattern leads, colored by kind
 and edge type - and exposes every tool as a form with results inline.
-
-<!-- media: replace with a real screenshot / clip once captured -->
-<!-- ![weaver manager client - 3D knowledge graph view](docs/media/manager-client.png) -->
-
-_Screenshot to come._
 
 ```bash
 ./start.ps1          # daemon (debug) + Vite dev server on :5173, from an external terminal
@@ -161,6 +162,26 @@ cargo build --release
 ```
 
 Requires a recent stable Rust toolchain.
+
+### Install on Linux
+
+On a systemd-based Linux desktop, install the release binary and a user service with:
+
+```bash
+./scripts/install-weaver-linux.sh
+```
+
+This installs `weaver` to `~/.local/bin`, creates a minimal configuration at
+`~/.config/weaver/config.yaml`, stores the SQLite database under `~/.local/share/weaver`, and
+starts the daemon at login. Existing configuration is preserved when reinstalling. Inspect it
+with `systemctl --user status weaver` and follow logs with
+`journalctl --user -u weaver -f`.
+
+To remove the service and binary while preserving configuration and data:
+
+```bash
+./scripts/uninstall-weaver-linux.sh
+```
 
 ## Running
 
@@ -216,6 +237,8 @@ Both AI integrations are optional and degrade gracefully when unset.
 | `WEAVER_LLM_PROVIDER` | `ollama` / `openai` / `mock` - powers episode fact extraction and lead synthesis |
 | `WEAVER_LLM_MODEL`, `WEAVER_OLLAMA_URL` | provider model and endpoint |
 | `OPENAI_API_KEY` | required for the `openai` provider |
+| `WEAVER_GITHUB_TOKEN` | optional - enriches `sync_prs_from_git` with PR bodies and reviews (falls back to `GITHUB_TOKEN`) |
+| `WEAVER_GITHUB_API_BASE` | GitHub Enterprise API base (default `https://api.github.com`) |
 | `WEAVER_DB`, `WEAVER_BIND`, `WEAVER_INDEX_REPO` | daemon startup without flags |
 
 With no embedding provider, `query` falls back to keyword + graph retrieval. With no LLM
@@ -256,11 +279,45 @@ preferred long-running workflow.
 **Rough edges / WIP:**
 
 - Storage is SQLite only, single-writer. The layer is abstracted for Postgres later.
-- Call-graph and route extraction are heuristic (tree-sitter AST patterns + regex), not a full
-  name resolver - which is why those edges carry confidence.
-- `find_decisions_for_code` module/service resolution leans on entity-name matching and a
-  path-segment fallback; it flags matches that came only from the fallback.
+- Call-graph and route extraction are heuristic tree-sitter AST pattern matching, not a full
+  name resolver - which is why those edges carry confidence. Routes: Express (JS/TS), FastAPI
+  and Flask (Python), Actix-web, Axum, and Rocket (Rust), Spring MVC (Java), net/http, Gin, and
+  chi (Go), ASP.NET Core (C#), Rails and Sinatra (Ruby), and Laravel (PHP). Framework
+  detection is syntactic, so it has known limits: Rocket and Sinatra are told apart from
+  Actix-web and plain Ruby by a mention in the file; ASP.NET `MapGroup(..)` prefixes, Axum
+  `.nest(..)`, Laravel dotted nested resources (`admin.photos`), and Rails `concern` / `mount`
+  / `devise_for` are not composed.
+- Pull requests are reconstructed from merge and squash commit messages, so a squash subject
+  ending in `(#N)` is taken as a PR even though it could be an issue reference. With a GitHub
+  token set, weaver checks: a number GitHub confirms is an issue is not ingested, and one it
+  cannot confirm (a 404 also covers repos the token cannot see) is kept, flagged unverified
+  (`enrichment: git`). Enrichment also fills in real titles and bodies.
+- `find_decisions_for_code` module/service resolution leans on entity-name matching (exact, then
+  a normalized-name retry that ignores case, separators and `service`/`module` words) and a
+  path-segment fallback; it flags matches that came from a fallback and suggests near-miss names
+  when nothing resolves. It does not use embeddings, so unrelated wordings of the same concept
+  do not match.
 - LLM fact-extraction quality tracks whatever model you point it at.
+
+## Prior work
+
+weaver builds on published work. The papers below are credited for what they shaped, not for
+anything they did not.
+
+- **EA-Graph** - Hsu, Chi, Everett. [*EA-Graph: Artifact-Anchored Verification Memory for
+  Coding Agents under Upstream Drift*](https://arxiv.org/abs/2608.04278) (arXiv 2608.04278).
+  weaver adopts content-hashed anchors, evidence grade kept separate from freshness, the
+  three-state disposition, and refusal with a rebuild obligation. See
+  [what we adopt](docs/DESIGN-claims-and-freshness.md#what-we-adopt-from-prior-art).
+- **CodeNib** - Yu, Yu, Yuan, Zhao, Chen, Dokania, Jagtap, Chang, Ma, Jayswal, Ni, Zhang, Chen,
+  Deng, Zhao. [*CodeNib: A Multi-View Data System for Serving Repository Context to Coding
+  Agents*](https://arxiv.org/abs/2607.25431) (arXiv 2607.25431). weaver adopts per-view
+  manifests, lag measured in commits, edit classification, content-addressed reuse, and an
+  offline output-equality oracle (see [the design doc](docs/DESIGN-claims-and-freshness.md)).
+- **Codebase-Memory** - Vogel, Meyer-Eschenbach, Kohler, Grünewald, Balzer.
+  [*Codebase-Memory: Tree-Sitter-Based Knowledge Graphs for LLM Code Exploration via
+  MCP*](https://arxiv.org/abs/2603.27277) (arXiv 2603.27277). Informed by, not adapted from:
+  it builds a Tree-sitter call graph, while weaver ingests decisions and git history.
 
 ## Project status
 

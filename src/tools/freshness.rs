@@ -358,6 +358,8 @@ pub fn lane_capabilities(lane: &str) -> Vec<String> {
         "adr" => &["governance_lookup", "consistency_check"],
         "symbol" => &["symbol_lookup", "call_path", "anchor_verification"],
         "commit" => &["commit_evidence", "stale_decision_activity"],
+        // Only what git alone guarantees; API enrichment is best-effort.
+        "pr" => &["pr_evidence", "pr_decision_links"],
         "embedding" => &["semantic_query"],
         "community" => &["architecture_communities"],
         "route" => &["route_lookup"],
@@ -419,6 +421,104 @@ pub async fn record_lane(
     let _ = store
         .upsert_index_lane(repo_id, lane, commit.as_deref(), &now, status, None)
         .await;
+}
+
+/// Lanes whose facts derive from source files, so a newer file makes them stale.
+const SOURCE_LANES: &[&str] = &["adr", "symbol", "route", "community"];
+
+/// Most files the staleness scan will visit before giving up.
+const STALENESS_SCAN_LIMIT: usize = 200_000;
+
+/// `(newest mtime among indexable files, whether the scan hit its limit)`.
+/// `adr_only` restricts it to documentation formats, the ones an ADR lane reads.
+fn newest_source_mtime(repo_path: &Path, adr_only: bool) -> (Option<std::time::SystemTime>, bool) {
+    let gitignore = crate::tools::ingest_symbols::load_archignore(repo_path)
+        .ok()
+        .flatten();
+    let mut newest: Option<std::time::SystemTime> = None;
+    let mut visited = 0usize;
+    let walker = walkdir::WalkDir::new(repo_path).into_iter().filter_entry(|e| {
+        !crate::tools::ingest_symbols::is_ignored_entry(e.path(), repo_path, gitignore.as_ref())
+    });
+    for entry in walker.filter_map(|e| e.ok()).filter(|e| e.file_type().is_file()) {
+        visited += 1;
+        if visited > STALENESS_SCAN_LIMIT {
+            return (newest, true);
+        }
+        let ext = entry.path().extension().and_then(|e| e.to_str()).unwrap_or("");
+        let relevant = if adr_only {
+            matches!(ext, "md" | "markdown" | "adoc" | "asciidoc")
+        } else {
+            crate::adapters::registry::has_extractor_for_extension(ext)
+        };
+        if !relevant {
+            continue;
+        }
+        if let Some(modified) = entry.metadata().ok().and_then(|m| m.modified().ok()) {
+            newest = newest.max(Some(modified));
+        }
+    }
+    (newest, false)
+}
+
+/// Staleness warnings for a repo with no git `HEAD` (not a git repo, or no
+/// commits yet), where `lag_commits` cannot be computed. Falls back to
+/// comparing each source-derived lane's last-indexed time with the newest
+/// modification time among the files that lane reads. Empty for a repo with a
+/// `HEAD`, which reports commit lag instead.
+pub async fn timestamp_staleness_warnings(
+    store: &Arc<SqliteStore>,
+    repo_id: Uuid,
+    repo_path: &Path,
+) -> Result<Vec<String>, Error> {
+    if head_commit(repo_path).is_some() {
+        return Ok(vec![]);
+    }
+    let lanes: Vec<_> = store
+        .index_lanes(repo_id)
+        .await?
+        .into_iter()
+        .filter(|l| SOURCE_LANES.contains(&l.lane.as_str()))
+        .collect();
+    if lanes.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let path = repo_path.to_path_buf();
+    let need_all = lanes.iter().any(|l| l.lane != "adr");
+    let need_adr = lanes.iter().any(|l| l.lane == "adr");
+    let (all, adr) = tokio::task::spawn_blocking(move || {
+        (
+            need_all.then(|| newest_source_mtime(&path, false)),
+            need_adr.then(|| newest_source_mtime(&path, true)),
+        )
+    })
+    .await
+    .map_err(|e| Error::Other(anyhow::anyhow!("staleness scan failed: {e}")))?;
+
+    let mut warnings = Vec::new();
+    for lane in &lanes {
+        let Ok(indexed_at) = chrono::DateTime::parse_from_rfc3339(&lane.last_ingested_at) else {
+            continue;
+        };
+        let (newest, truncated) = match if lane.lane == "adr" { adr } else { all } {
+            Some(scan) => scan,
+            None => continue,
+        };
+        let Some(newest) = newest else { continue };
+        let newest: chrono::DateTime<Utc> = newest.into();
+        if newest > indexed_at.with_timezone(&Utc) {
+            warnings.push(format!(
+                "lane '{}' may be stale: files changed after it was last indexed ({}); \
+                 commit lag is unavailable because {} has no git HEAD. Run ingest_symbols or sync_incremental to refresh{}",
+                lane.lane,
+                &lane.last_ingested_at[..lane.last_ingested_at.len().min(19)],
+                repo_path.display(),
+                if truncated { " (scan limit reached, so newer files may exist)" } else { "" },
+            ));
+        }
+    }
+    Ok(warnings)
 }
 
 /// `git rev-list --count <commit>..HEAD`. `None` when git is unavailable.

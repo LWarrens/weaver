@@ -35,6 +35,7 @@ pub struct EmbedAllResult {
     pub constraints_embedded: usize,
     pub episodes_embedded: usize,
     pub commits_embedded: usize,
+    pub pull_requests_embedded: usize,
     pub symbols_embedded: usize,
     pub entity_nodes_embedded: usize,
     pub warnings: Vec<String>,
@@ -67,10 +68,11 @@ pub async fn run(store: &Arc<SqliteStore>, params: EmbedAllParams) -> Result<Emb
                 constraints_embedded: 0,
                 episodes_embedded: 0,
                 commits_embedded: 0,
+                pull_requests_embedded: 0,
                 symbols_embedded: 0,
                 entity_nodes_embedded: 0,
                 warnings: vec![
-                    "No embedding provider configured (ARCH_MCP_EMBEDDING_PROVIDER not set). \
+                    "No embedding provider configured (WEAVER_EMBEDDING_PROVIDER not set). \
                      Set it to 'lmstudio', 'ollama', or 'openai' before running embed_all."
                         .to_string(),
                 ],
@@ -87,6 +89,7 @@ pub async fn run(store: &Arc<SqliteStore>, params: EmbedAllParams) -> Result<Emb
     let mut constraints_embedded = 0usize;
     let mut episodes_embedded = 0usize;
     let mut commits_embedded = 0usize;
+    let mut pull_requests_embedded = 0usize;
     let mut symbols_embedded = 0usize;
     let mut entity_nodes_embedded = 0usize;
 
@@ -206,6 +209,37 @@ pub async fn run(store: &Arc<SqliteStore>, params: EmbedAllParams) -> Result<Emb
         }
     }
 
+    // Pull requests
+    let items = store.fetch_pull_requests_without_embeddings(repo.id).await?;
+    let outcomes: Vec<Result<bool, String>> = stream::iter(items)
+        .map(|(id, text)| {
+            let store = store.clone();
+            let provider = provider.clone();
+            async move {
+                if text.trim().is_empty() {
+                    return Ok(false);
+                }
+                match provider.embed_chunked(&text, chunk_size).await {
+                    Ok(vec) if !vec.is_empty() => {
+                        let blob = pack_f32(&vec);
+                        Ok(store.update_pull_request_embedding(&id, &blob).await.is_ok())
+                    }
+                    Ok(_) => Err(format!("pull_request {id}: embedding was empty")),
+                    Err(e) => Err(format!("pull_request {id}: {e}")),
+                }
+            }
+        })
+        .buffer_unordered(CONCURRENCY)
+        .collect()
+        .await;
+    for o in outcomes {
+        match o {
+            Ok(true) => pull_requests_embedded += 1,
+            Err(w) => warnings.push(w),
+            _ => {}
+        }
+    }
+
     // Symbols
     let items = store.fetch_symbols_without_embeddings(repo.id).await?;
     let outcomes: Vec<Result<bool, String>> = stream::iter(items)
@@ -278,6 +312,7 @@ pub async fn run(store: &Arc<SqliteStore>, params: EmbedAllParams) -> Result<Emb
         constraints_embedded,
         episodes_embedded,
         commits_embedded,
+        pull_requests_embedded,
         symbols_embedded,
         entity_nodes_embedded,
         warnings,

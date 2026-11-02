@@ -90,7 +90,7 @@ pub async fn run(
             "evidence_anchors",
         ],
         warnings: vec![
-            "temporal_edges, commits, pull_requests, and decision_git_links may be empty until their ingestion tools are implemented".to_string(),
+            "temporal_edges, commits, pull_requests, and decision_git_links stay empty until their ingestion tools are run (sync_commits_from_git, sync_prs_from_git)".to_string(),
         ],
     })
 }
@@ -103,8 +103,8 @@ fn table_role(table: &str) -> &'static str {
         "constraints" => "decision constraints extracted from ADRs or supplied episodes",
         "files" => "tracked source files",
         "symbols" => "tree-sitter symbol index",
-        "commits" => "git commit evidence table, currently schema-only",
-        "pull_requests" => "pull request evidence table, currently schema-only",
+        "commits" => "git commit evidence, populated by sync_commits_from_git",
+        "pull_requests" => "pull request evidence, populated by sync_prs_from_git",
         "episodes" => "raw architectural events and discussions",
         "claims" => "fine-grained verifiable assertions decomposed from decisions and constraints",
         "evidence_anchors" => "content-hashed citation spans backing each claim",

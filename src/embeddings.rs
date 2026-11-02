@@ -252,14 +252,31 @@ impl EmbeddingProvider for LmStudioEmbeddingProvider {
 // Factory
 // ---------------------------------------------------------------------------
 
+tokio::task_local! {
+    static PROVIDER_DISABLED: ();
+}
+
+/// Run `fut` with [`provider_from_env`] returning `None`, whatever the
+/// environment configures (REQ-058: the integrity oracle's rebuild is offline).
+///
+/// Scoped to the current task, so concurrent tool calls are unaffected. It does
+/// not reach futures handed to `tokio::spawn`.
+pub async fn without_provider<F: std::future::Future>(fut: F) -> F::Output {
+    PROVIDER_DISABLED.scope((), fut).await
+}
+
 /// Build an embedding provider from environment variables.
-/// Returns `None` when no provider is configured (graceful degradation).
+/// Returns `None` when no provider is configured (graceful degradation), or
+/// inside a [`without_provider`] scope.
 ///
 /// Provider names (WEAVER_EMBEDDING_PROVIDER):
 ///   "lmstudio" — LM Studio local server (OpenAI-compatible, no key)
 ///   "ollama"   — Ollama local server
 ///   "openai"   — OpenAI API (requires OPENAI_API_KEY)
 pub fn provider_from_env() -> Option<Box<dyn EmbeddingProvider>> {
+    if PROVIDER_DISABLED.try_with(|_| ()).is_ok() {
+        return None;
+    }
     let provider_name = std::env::var("WEAVER_EMBEDDING_PROVIDER").unwrap_or_default();
     match provider_name.to_ascii_lowercase().as_str() {
         "lmstudio" => LmStudioEmbeddingProvider::from_env()

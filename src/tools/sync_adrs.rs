@@ -2,7 +2,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use chrono::Utc;
-use glob::{glob, Pattern};
+use glob::glob;
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -58,14 +59,13 @@ pub async fn run(
     params: SyncAdrsFromGitParams,
 ) -> Result<SyncAdrsResult, Error> {
     // --- Input validation ---------------------------------------------------
-    let repo_path = dunce::canonicalize(&params.repo_path)
-        .map_err(|_| Error::InvalidInput {
-            field: "repo_path",
-            reason: format!(
-                "path does not exist or is not accessible: {}",
-                params.repo_path
-            ),
-        })?;
+    let repo_path = dunce::canonicalize(&params.repo_path).map_err(|_| Error::InvalidInput {
+        field: "repo_path",
+        reason: format!(
+            "path does not exist or is not accessible: {}",
+            params.repo_path
+        ),
+    })?;
 
     if params.adr_glob.is_empty() {
         return Err(Error::InvalidInput {
@@ -117,8 +117,12 @@ pub async fn run(
         .filter(|p| p.is_file())
         .collect();
 
-    // Filter out gitignored paths and any patterns listed in .archignore.
+    // Filter out gitignored paths and anything excluded by .archignore.
     // This prevents broad globs like **/*.md from sweeping node_modules/ etc.
+    // .archignore uses gitignore syntax (including `!` negation), so it is loaded
+    // the same way ingest_symbols.rs loads it — via the `ignore` crate's
+    // Gitignore matcher, not a flat list of glob::Pattern (which has no concept
+    // of negation and would let a leading `*` block every subsequent `!allow` line).
     let git_repo = git2::Repository::open(&repo_path).ok();
     let archignore = load_archignore(&repo_path);
     paths.retain(|p| {
@@ -131,8 +135,16 @@ pub async fn run(
                 return false;
             }
         }
-        let rel_str = rel.to_string_lossy().replace('\\', "/");
-        !archignore.iter().any(|pat| pat.matches(&rel_str))
+        if let Some(ref g) = archignore {
+            let m = g.matched_path_or_any_parents(rel, false);
+            if m.is_whitelist() {
+                return true;
+            }
+            if m.is_ignore() {
+                return false;
+            }
+        }
+        true
     });
 
     let now = Utc::now().to_rfc3339();
@@ -400,7 +412,9 @@ pub async fn run(
                     if let Ok(vec) = provider.embed(&ec.text).await {
                         if !vec.is_empty() {
                             let blob = pack_f32(&vec);
-                            let _ = store.update_constraint_embedding(constraint_id, &blob).await;
+                            let _ = store
+                                .update_constraint_embedding(constraint_id, &blob)
+                                .await;
                         }
                     }
                 }
@@ -537,16 +551,17 @@ async fn resolve_supersession_edges(
     Ok(closed)
 }
 
-/// Read `.archignore` from the repository root and compile each non-comment line
-/// into a glob Pattern. Callers use these to exclude paths from ADR ingestion.
-fn load_archignore(repo_path: &std::path::Path) -> Vec<Pattern> {
-    std::fs::read_to_string(repo_path.join(".archignore"))
-        .unwrap_or_default()
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .filter_map(|pat| Pattern::new(pat).ok())
-        .collect()
+/// Read `.archignore` from the repository root as a gitignore-syntax matcher
+/// (supports `!` negation), matching how `ingest_symbols.rs` loads the same
+/// file. Returns `None` when the file is absent or fails to parse.
+fn load_archignore(repo_path: &std::path::Path) -> Option<Gitignore> {
+    let archignore_path = repo_path.join(".archignore");
+    if !archignore_path.exists() {
+        return None;
+    }
+    let mut builder = GitignoreBuilder::new(repo_path);
+    builder.add(archignore_path);
+    builder.build().ok()
 }
 
 fn adr_effective_from(

@@ -19,7 +19,7 @@ Storage schema, temporal model, graph model, and repository layout. See [TOOLS.m
 | `symbol_edges` | Typed edges between symbols (CALLS, IMPORTS, contains) |
 | `commits` | Git commits |
 | `commit_files` | Files touched by each commit (co-change analysis) |
-| `pull_requests` | Git PRs |
+| `pull_requests` | Pull requests derived from merge/squash commits, optionally GitHub-enriched |
 | `episodes` | Recorded architectural events |
 | `entity_nodes` | Canonical entity identity and resolution for episode-sourced facts |
 | `decision_code_links` | Decision ↔ file/symbol links |
@@ -65,7 +65,7 @@ Historical facts are never destructively overwritten. When a fact is superseded,
 
 ## Graph Model
 
-Architectural knowledge is stored in SQLite tables. `supersession_edges` is populated by ADR sync. `temporal_edges` is populated with ADR-typed edges (`applies_to`, `depends_on`, `conflicts_with`), `defines`/`imposes` edges from ADR sync and episode ingestion, and `evidences` Commit→Decision edges from `sync_commits_from_git`; it is traversed by `impact_of` and by `query`'s graph expansion. `symbol_edges` holds symbol-level edges (CALLS, IMPORTS, contains) emitted during `ingest_symbols`. Files remain the location/indexing layer for paths, hashes, ADR links, commits, and routes; symbol graph views keep file paths as symbol metadata instead of organizing symbols through synthetic file-to-symbol containment.
+Architectural knowledge is stored in SQLite tables. `supersession_edges` is populated by ADR sync. `temporal_edges` is populated with ADR-typed edges (`applies_to`, `depends_on`, `conflicts_with`), `defines`/`imposes` edges from ADR sync and episode ingestion, and `evidences` Commit→Decision edges from `sync_commits_from_git`; `sync_prs_from_git` adds `evidences` PR→Decision and `includes` PR→Commit edges. It is traversed by `impact_of` and by `query`'s graph expansion. `symbol_edges` holds symbol-level edges (CALLS, IMPORTS, contains) emitted during `ingest_symbols`. Files remain the location/indexing layer for paths, hashes, ADR links, commits, and routes; symbol graph views keep file paths as symbol metadata instead of organizing symbols through synthetic file-to-symbol containment.
 
 ### Node Types
 
@@ -172,7 +172,7 @@ src/
     registry.rs
     symbols.rs
 
-migrations/           # 0001_initial.sql … 0019_drop_evidence_spans.sql (repo root)
+migrations/           # 0001_initial.sql … 0021_pull_request_enrichment.sql (repo root)
 scripts/
   install-weaver-task.ps1    # register the logon-start scheduled task (Windows)
   uninstall-weaver-task.ps1

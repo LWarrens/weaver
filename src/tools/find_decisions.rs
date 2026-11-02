@@ -268,9 +268,27 @@ pub async fn run(
     ] {
         let Some(name) = name else { continue };
 
-        let entities = store
+        let mut entities = store
             .find_entity_nodes_by_name(repo.id, name, Some(kind))
             .await?;
+        // No exact name: retry on normalized names ("auth-service" ~ "AuthService"
+        // ~ "Auth Service"). Matches are reported as such, never passed off as exact.
+        let mut normalized_names: Vec<String> = Vec::new();
+        let mut candidates: Vec<crate::domain::entities::EntityNode> = Vec::new();
+        if entities.is_empty() {
+            candidates = store.list_open_entity_nodes(repo.id, kind).await?;
+            let key = entity_key(name);
+            if !key.is_empty() {
+                entities = candidates
+                    .iter()
+                    .filter(|e| entity_key(&e.canonical_name) == key)
+                    .cloned()
+                    .collect();
+                normalized_names = entities.iter().map(|e| e.canonical_name.clone()).collect();
+                normalized_names.sort();
+                normalized_names.dedup();
+            }
+        }
         let entity_ids: Vec<String> = entities.iter().map(|e| e.id.to_string()).collect();
         let mut decision_ids = store
             .decision_ids_mentioning_entities(&entity_ids, valid_at)
@@ -284,11 +302,16 @@ pub async fn run(
         decision_ids.dedup();
 
         if decision_ids.is_empty() {
-            warnings.push(format!(
+            let mut warning = format!(
                 "{} '{}' did not resolve to any entity or linked decision — \
                  sync ADRs or record episodes mentioning it first",
                 kind, name
-            ));
+            );
+            let suggestions = similar_entity_names(name, &candidates);
+            if !suggestions.is_empty() {
+                warning.push_str(&format!(" (did you mean: {}?)", suggestions.join(", ")));
+            }
+            warnings.push(warning);
             continue;
         }
 
@@ -312,9 +335,11 @@ pub async fn run(
                 kind,
                 name,
                 if via_entity == 0 {
-                    " (via file-path match only)"
+                    " (via file-path match only)".to_string()
+                } else if !normalized_names.is_empty() {
+                    format!(" (via normalized name match: {})", normalized_names.join(", "))
                 } else {
-                    ""
+                    String::new()
                 }
             );
             response.decisions.extend(new_decisions);
@@ -360,6 +385,86 @@ pub async fn run(
     .await?;
 
     Ok(response)
+}
+
+// ---------------------------------------------------------------------------
+// Entity-name matching
+// ---------------------------------------------------------------------------
+
+/// Words that name the *kind* of thing rather than which one, so "billing",
+/// "billing-service" and "BillingModule" share a key.
+const GENERIC_NAME_TOKENS: &[&str] = &["service", "services", "svc", "module", "modules"];
+
+/// Lower-cased word tokens of an entity name: split on non-alphanumerics and
+/// camelCase boundaries, generic kind words dropped (unless that would leave
+/// nothing), and a trailing plural `s` folded.
+fn entity_tokens(name: &str) -> Vec<String> {
+    let mut tokens: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut prev_lower = false;
+    for c in name.chars() {
+        if !c.is_alphanumeric() {
+            if !cur.is_empty() {
+                tokens.push(std::mem::take(&mut cur));
+            }
+            prev_lower = false;
+            continue;
+        }
+        if c.is_uppercase() && prev_lower && !cur.is_empty() {
+            tokens.push(std::mem::take(&mut cur));
+        }
+        prev_lower = c.is_lowercase() || c.is_numeric();
+        cur.extend(c.to_lowercase());
+    }
+    if !cur.is_empty() {
+        tokens.push(cur);
+    }
+    let kept: Vec<String> = tokens
+        .iter()
+        .filter(|t| !GENERIC_NAME_TOKENS.contains(&t.as_str()))
+        .cloned()
+        .collect();
+    let chosen = if kept.is_empty() { tokens } else { kept };
+    chosen
+        .into_iter()
+        .map(|t| {
+            if t.len() > 3 && t.ends_with('s') && !t.ends_with("ss") {
+                t[..t.len() - 1].to_string()
+            } else {
+                t
+            }
+        })
+        .collect()
+}
+
+/// Normalized identity of an entity name; equal keys mean "the same name,
+/// written differently".
+fn entity_key(name: &str) -> String {
+    entity_tokens(name).join(" ")
+}
+
+/// Up to three known entity names that share words with `name`, offered as a
+/// hint when nothing resolved. Suggestions are never used as results.
+fn similar_entity_names(name: &str, candidates: &[crate::domain::entities::EntityNode]) -> Vec<String> {
+    let want: HashSet<String> = entity_tokens(name).into_iter().collect();
+    if want.is_empty() {
+        return Vec::new();
+    }
+    let mut scored: Vec<(f64, String)> = candidates
+        .iter()
+        .filter_map(|e| {
+            let have: HashSet<String> = entity_tokens(&e.canonical_name).into_iter().collect();
+            let shared = want.intersection(&have).count();
+            if shared == 0 {
+                return None;
+            }
+            let union = want.union(&have).count();
+            Some((shared as f64 / union as f64, e.canonical_name.clone()))
+        })
+        .collect();
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap().then_with(|| a.1.cmp(&b.1)));
+    scored.dedup_by(|a, b| a.1 == b.1);
+    scored.into_iter().take(3).map(|(_, n)| n).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -514,6 +619,89 @@ mod tests {
                 .contains("via file-path match only"),
             "answer: {:?}",
             resp.answer
+        );
+    }
+
+    #[test]
+    fn entity_key_ignores_case_separators_kind_words_and_plurals() {
+        for name in ["auth-service", "AuthService", "Auth Service", "auth_svc", "Auths"] {
+            assert_eq!(entity_key(name), "auth", "{name}");
+        }
+        // A name that is only a kind word keeps it rather than vanishing.
+        assert_eq!(entity_key("service"), "service");
+        assert_ne!(entity_key("billing"), entity_key("billing-gateway"));
+        assert_eq!(entity_key("class"), "class", "`ss` is not a plural");
+    }
+
+    async fn record_billing_episode(store: &Arc<SqliteStore>, repo_path: &str, entity: &str) {
+        record_episode::run(
+            store,
+            RecordDecisionEpisodeParams {
+                repo_path: repo_path.to_string(),
+                source: "meeting:billing".to_string(),
+                source_uri: None,
+                occurred_at: "2026-07-01T09:00:00Z".to_string(),
+                content: "Billing rework discussion.".to_string(),
+                decisions: Some(vec![EpisodeDecision {
+                    title: Some("Async invoicing".to_string()),
+                    text: "Invoicing becomes asynchronous behind a queue.".to_string(),
+                    constraints: vec![],
+                    affected_files: vec![],
+                    entities: vec![entity.to_string()],
+                }]),
+                dedup_threshold: None,
+            },
+        )
+        .await
+        .expect("episode");
+    }
+
+    fn service_target(name: &str) -> Target {
+        Target {
+            file: None,
+            symbol: None,
+            module: None,
+            service: Some(name.to_string()),
+        }
+    }
+
+    #[tokio::test]
+    async fn resolves_service_by_normalized_name_and_says_so() {
+        let store = test_store().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo_path = dir.path().to_str().unwrap().to_string();
+        record_billing_episode(&store, &repo_path, "Billing Service").await;
+
+        let resp = run(&store, params(&repo_path, service_target("billing-svc")))
+            .await
+            .expect("find");
+
+        assert_eq!(resp.decisions.len(), 1, "warnings: {:?}", resp.warnings);
+        let answer = resp.answer.as_deref().unwrap();
+        assert!(
+            answer.contains("via normalized name match: Billing Service"),
+            "answer: {answer}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unresolved_service_suggests_similar_names_without_resolving_them() {
+        let store = test_store().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo_path = dir.path().to_str().unwrap().to_string();
+        record_billing_episode(&store, &repo_path, "billing gateway").await;
+
+        let resp = run(&store, params(&repo_path, service_target("billing-api")))
+            .await
+            .expect("find");
+
+        assert!(resp.decisions.is_empty(), "suggestions must not resolve");
+        assert!(
+            resp.warnings
+                .iter()
+                .any(|w| w.contains("did you mean: billing gateway")),
+            "warnings: {:?}",
+            resp.warnings
         );
     }
 

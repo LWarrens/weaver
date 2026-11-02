@@ -20,6 +20,9 @@ pub struct SymbolEdge {
     pub edge_type: String,
     pub confidence: f64,
     pub valid_from: String,
+    /// How `to_id` was resolved: `same-file`, `receiver-type`, `import`,
+    /// `module-path`, `unique-name`, `unresolved`, `contains`, or `legacy`.
+    pub resolution: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -87,6 +90,15 @@ pub struct SqliteStore {
     pool: SqlitePool,
 }
 
+impl SqliteStore {
+    /// Raw pool access for in-crate tests that assert on schema-level rows for
+    /// which no read-side API exists yet. Not part of the production surface.
+    #[cfg(test)]
+    pub(crate) fn pool(&self) -> &SqlitePool {
+        &self.pool
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SchemaColumn {
     pub name: String,
@@ -127,6 +139,9 @@ pub struct IndexStatusCounts {
     pub commits_total: i64,
     pub commits_embedded: i64,
     pub commits_last_ingested_at: Option<String>,
+    pub prs_total: i64,
+    pub prs_embedded: i64,
+    pub prs_last_ingested_at: Option<String>,
     pub symbols_total: i64,
     pub symbols_embedded: i64,
     pub symbols_last_ingested_at: Option<String>,

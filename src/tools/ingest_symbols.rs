@@ -53,6 +53,12 @@ struct PendingFile {
     local_ids: std::collections::HashMap<String, Uuid>,
     symbols: Vec<crate::adapters::symbols::Symbol>,
     raw_edges: Vec<crate::adapters::edges::RawEdge>,
+    /// Local `var -> type` bindings observed in this file, for receiver-type resolution.
+    bindings: Vec<crate::adapters::edges::RawBinding>,
+    /// The file itself is unchanged; only its edges are being re-resolved because
+    /// a name they depend on was added or removed elsewhere. Its symbols and
+    /// `contains` edges are left alone.
+    edges_only: bool,
 }
 
 /// Compute a hex-encoded SHA-256 digest of a string.
@@ -60,6 +66,70 @@ pub fn sha256_hex(s: &str) -> String {
     let mut h = Sha256::new();
     h.update(s.as_bytes());
     format!("{:x}", h.finalize())
+}
+
+/// Candidate repo-relative file paths a module specifier could resolve to.
+/// `from_rel` is the importing file's repo-relative path; `spec` is the raw
+/// specifier (`./foo`, `../bar/baz`, `foo/bar`, `foo.bar` already slash-normalised
+/// by the extractor).
+fn module_spec_candidates(from_rel: &str, spec: &str) -> Vec<String> {
+    use std::path::Path;
+    let base = if spec.starts_with('.') || spec.starts_with('/') {
+        Path::new(from_rel)
+            .parent()
+            .map(|p| p.join(spec).to_string_lossy().replace('\\', "/"))
+            .unwrap_or_else(|| spec.replace('\\', "/"))
+    } else {
+        spec.replace('\\', "/")
+    };
+    // Normalise `a/b/../c` → `a/c` and strip `./` segments.
+    let mut parts: Vec<&str> = Vec::new();
+    for seg in base.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            s => parts.push(s),
+        }
+    }
+    let s = parts.join("/");
+    [
+        s.clone(),
+        format!("{s}.ts"),
+        format!("{s}.tsx"),
+        format!("{s}.js"),
+        format!("{s}.jsx"),
+        format!("{s}.mjs"),
+        format!("{s}.py"),
+        format!("{s}.rb"),
+        format!("{s}.go"),
+        format!("{s}.java"),
+        format!("{s}.rs"),
+        format!("{s}/index.ts"),
+        format!("{s}/index.js"),
+        format!("{s}/__init__.py"),
+        format!("{s}/mod.rs"),
+    ]
+    .into_iter()
+    .filter(|c| !c.is_empty())
+    .collect()
+}
+
+/// Resolve a module specifier to a concrete file UUID in this repo, if one of the
+/// candidate paths exists.
+async fn resolve_spec_to_file(
+    store: &SqliteStore,
+    repo_id: Uuid,
+    from_rel: &str,
+    spec: &str,
+) -> Option<Uuid> {
+    for cand in module_spec_candidates(from_rel, spec) {
+        if let Ok(Some(fid)) = store.find_file_id_by_path(repo_id, &cand).await {
+            return Some(fid);
+        }
+    }
+    None
 }
 
 pub async fn run(
@@ -90,17 +160,13 @@ pub async fn run(
     let mut warnings = Vec::new();
 
     // Load .archignore (gitignore-style) from repository root if present
-    let mut gitignore: Option<Gitignore> = None;
-    let archignore_path = repo_path.join(".archignore");
-    if archignore_path.exists() {
-        let mut builder = GitignoreBuilder::new(&repo_path);
-        // Add the .archignore file for parsing
-        builder.add(archignore_path);
-        match builder.build() {
-            Ok(g) => gitignore = Some(g),
-            Err(err) => warnings.push(format!("failed to parse .archignore: {}", err)),
+    let gitignore = match load_archignore(&repo_path) {
+        Ok(g) => g,
+        Err(err) => {
+            warnings.push(format!("failed to parse .archignore: {}", err));
+            None
         }
-    }
+    };
 
     let now = Utc::now().to_rfc3339();
     let mut processed = 0usize;
@@ -151,6 +217,7 @@ pub async fn run(
     // -------------------------------------------------------------------------
 
     let mut pending: Vec<PendingFile> = Vec::new();
+    let names_before = store.open_symbol_name_counts(repo.id).await?;
 
     for entry in &eligible {
         // Check cancellation before each file so the job can be stopped cleanly.
@@ -284,7 +351,9 @@ pub async fn run(
             }
 
             // Collect raw edges; resolution deferred to pass 2 (all symbols in DB then).
-            let raw_edges = extract_edges_for_extension(ext, &content);
+            let file_edges = extract_edges_for_extension(ext, &content);
+            let raw_edges = file_edges.edges;
+            let bindings = file_edges.bindings;
 
             // Persist the new hash so this file is skipped on the next unchanged run.
             let _ = store.update_file_content_hash(file_id, &hash).await;
@@ -307,114 +376,165 @@ pub async fn run(
                 local_ids,
                 symbols,
                 raw_edges,
+                bindings,
+                edges_only: false,
             });
         }
     }
 
     // -------------------------------------------------------------------------
+    // Retirement: a file that is gone (or, under the default pattern, no longer
+    // eligible) keeps no open symbols, edges, imports or routes, and edges that
+    // point at any retired symbol go back to unresolved. Without this an
+    // unchanged caller keeps a resolved edge to a symbol that no longer exists,
+    // which a full re-index would never produce. Runs before edge resolution so
+    // the name census below sees the final symbol set.
+    // -------------------------------------------------------------------------
+    {
+        let eligible_paths: std::collections::HashSet<&str> =
+            eligible.iter().map(|f| f.rel.as_str()).collect();
+        let default_pattern = params.pattern.is_none();
+        store
+            .retire_files_where(
+                repo.id,
+                &|path| {
+                    if default_pattern {
+                        !eligible_paths.contains(path)
+                    } else {
+                        !repo_path.join(path).is_file()
+                    }
+                },
+                &now,
+            )
+            .await?;
+        store.close_edges_from_retired_symbols(repo.id, &now).await?;
+        store.unresolve_edges_to_retired_symbols(repo.id).await?;
+    }
+
+    // -------------------------------------------------------------------------
+    // Name-dependent edges. Unique-name resolution (and the unresolved state)
+    // depends on how many symbols share a name repo-wide, so an unchanged file's
+    // edge can be stale after another file adds or drops a symbol with that name
+    // (a once-unique target turns ambiguous; an unresolved one gains a target;
+    // a better tier such as `import` now applies). Re-resolve the edges of every
+    // unchanged file that references a name whose symbol count changed this run.
+    // -------------------------------------------------------------------------
+    let mut refreshed = 0usize;
+    {
+        let after = store.open_symbol_name_counts(repo.id).await?;
+        let mut changed: Vec<String> = after
+            .iter()
+            .filter(|(name, n)| names_before.get(*name) != Some(*n))
+            .map(|(name, _)| name.clone())
+            .collect();
+        changed.extend(
+            names_before
+                .keys()
+                .filter(|name| !after.contains_key(*name))
+                .cloned(),
+        );
+        if !changed.is_empty() {
+            let already: std::collections::HashSet<String> =
+                pending.iter().map(|pf| pf.rel.clone()).collect();
+            let by_rel: std::collections::HashMap<&str, &EligibleFile> =
+                eligible.iter().map(|f| (f.rel.as_str(), f)).collect();
+            let mut rels = store
+                .files_with_open_edges_to_names(repo.id, &changed)
+                .await?;
+            rels.sort();
+            for rel in rels {
+                if already.contains(&rel) {
+                    continue;
+                }
+                let Some(entry) = by_rel.get(rel.as_str()) else {
+                    continue;
+                };
+                let Ok(content) = std::fs::read_to_string(&entry.path) else {
+                    continue;
+                };
+                let Some(file_id) = store.find_file_id_by_path(repo.id, &rel).await? else {
+                    continue;
+                };
+                let Ok(symbols) = extract_symbols_for_extension(&entry.ext, &content) else {
+                    continue;
+                };
+                let mut local_ids: std::collections::HashMap<String, Uuid> =
+                    std::collections::HashMap::new();
+                for s in &symbols {
+                    if let Ok(Some(id)) = store.find_symbol_id_in_file(file_id, &s.name).await {
+                        local_ids.insert(s.name.clone(), id);
+                    }
+                }
+                let file_edges = extract_edges_for_extension(&entry.ext, &content);
+                pending.push(PendingFile {
+                    rel,
+                    file_id,
+                    local_ids,
+                    symbols,
+                    raw_edges: file_edges.edges,
+                    bindings: file_edges.bindings,
+                    edges_only: true,
+                });
+                refreshed += 1;
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Pass 1.5: resolve each file's imports into `file_imports` and build an
+    // in-memory lookup keyed by (importing file, imported name) that the call
+    // resolver consults for the `import` tier.
+    // -------------------------------------------------------------------------
+    let mut imports_map: std::collections::HashMap<(Uuid, String), (Option<Uuid>, Option<Uuid>)> =
+        std::collections::HashMap::new();
+    for pf in &pending {
+        store.close_stale_file_imports_for_file(pf.file_id, &now).await?;
+        for raw in &pf.raw_edges {
+            if raw.edge_type != "imports" || raw.to_name.is_empty() || raw.to_name == "*" {
+                continue;
+            }
+            let to_file_id = match &raw.to_file {
+                Some(spec) => resolve_spec_to_file(store, repo.id, &pf.rel, spec).await,
+                None => None,
+            };
+            let to_symbol_id = match to_file_id {
+                Some(fid) => store
+                    .find_symbol_id_in_file(fid, &raw.to_name)
+                    .await
+                    .ok()
+                    .flatten(),
+                None => None,
+            };
+            store
+                .insert_file_import(
+                    repo.id,
+                    pf.file_id,
+                    &raw.to_name,
+                    raw.to_file.as_deref(),
+                    to_file_id,
+                    to_symbol_id,
+                    &now,
+                )
+                .await?;
+            imports_map
+                .entry((pf.file_id, raw.to_name.clone()))
+                .or_insert((to_file_id, to_symbol_id));
+        }
+    }
+
+    // -------------------------------------------------------------------------
     // Pass 2: resolve and insert edges — all symbols are in the DB now so
-    // cross-file targets (tiers 2 and 3) can be resolved.
+    // cross-file targets can be resolved. Resolution tiers, best first:
+    // same-file (0.95) > receiver-type (0.9) > import (0.9) > module-path (0.8)
+    // > repo-wide unique name (0.6) > unresolved (0.3).
     // -------------------------------------------------------------------------
 
-    for pf in &pending {
-        let mut closed_stale: std::collections::HashSet<Uuid> =
-            std::collections::HashSet::new();
-
-        for raw in &pf.raw_edges {
-            let from_id = match pf.local_ids.get(&raw.from_name) {
-                Some(id) => *id,
-                None => continue,
-            };
-
-            // Close stale edges once per source symbol (not once per edge).
-            if closed_stale.insert(from_id) {
-                store.close_stale_edges_for_symbol(from_id, &now).await?;
-            }
-
-            let mut resolved_to: Option<Uuid> = None;
-            let mut confidence: f64 = 0.3;
-
-            // Tier 1: same file exact match (0.95).
-            if let Some(tid) = pf.local_ids.get(&raw.to_name) {
-                resolved_to = Some(*tid);
-                confidence = 0.95;
-            } else if let Some(ref to_file_spec) = raw.to_file {
-                // Tier 2: module-path resolution (0.85).
-                use std::path::Path;
-                if to_file_spec.starts_with('.') || to_file_spec.starts_with('/') {
-                    let cur = Path::new(&pf.rel);
-                    if let Some(parent) = cur.parent() {
-                        let joined = parent.join(to_file_spec);
-                        let mut candidates: Vec<String> = Vec::new();
-                        let s = joined.to_string_lossy().replace('\\', "/");
-                        candidates.push(s.clone());
-                        candidates.push(format!("{}.ts", s));
-                        candidates.push(format!("{}.js", s));
-                        candidates.push(format!("{}.tsx", s));
-                        candidates.push(format!("{}.py", s));
-                        candidates.push(format!("{}.rb", s));
-                        candidates.push(format!("{}/index.ts", s));
-                        candidates.push(format!("{}/index.js", s));
-                        candidates.push(format!("{}/__init__.py", s));
-                        for cand in candidates {
-                            if let Ok(Some(fid)) = store.find_file_id_by_path(repo.id, &cand).await {
-                                if let Ok(Some(sym_id)) = store.find_symbol_id_in_file(fid, &raw.to_name).await {
-                                    resolved_to = Some(sym_id);
-                                    confidence = 0.85;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    let s = to_file_spec.replace('\\', "/");
-                    let candidates = [
-                        s.clone(),
-                        format!("{}.py", s),
-                        format!("{}.java", s),
-                        format!("{}.go", s),
-                        format!("{}.rb", s),
-                        format!("{}.ts", s),
-                        format!("{}.js", s),
-                        format!("{}/__init__.py", s),
-                    ];
-                    for cand in &candidates {
-                        if let Ok(Some(fid)) = store.find_file_id_by_path(repo.id, cand).await {
-                            if let Ok(Some(sym_id)) = store.find_symbol_id_in_file(fid, &raw.to_name).await {
-                                resolved_to = Some(sym_id);
-                                confidence = 0.85;
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Tier 3: repo-wide unique name (0.75).
-            if resolved_to.is_none() {
-                if let Ok(Some(tid)) = store
-                    .find_unique_symbol_id_in_repo(repo.id, &raw.to_name)
-                    .await
-                {
-                    resolved_to = Some(tid);
-                    confidence = 0.75;
-                }
-            }
-
-            let edge = SymbolEdge {
-                id: Uuid::new_v4(),
-                repo_id: repo.id,
-                from_id,
-                to_id: resolved_to,
-                to_name: Some(raw.to_name.clone()),
-                edge_type: raw.edge_type.to_string(),
-                confidence,
-                valid_from: now.clone(),
-            };
-            store.insert_symbol_edge(&edge).await?;
-        }
-
-        // Emit `contains` edges using line-range nesting.
+    // Pass 2a: emit `contains` edges for every pending file up front, so
+    // receiver-type resolution can consult them regardless of file walk order.
+    for pf in pending.iter().filter(|pf| !pf.edges_only) {
+        // The file is being re-ingested: retire its previous `contains` edges before
+        // emitting the current set (see `close_stale_edges_for_symbol`).
+        store.close_contains_edges_for_file(pf.file_id, &now).await?;
         if pf.symbols.len() > 1 {
             let mut sym_ids: Vec<(&crate::adapters::symbols::Symbol, Uuid)> = Vec::new();
             for s in &pf.symbols {
@@ -437,11 +557,128 @@ pub async fn run(
                             edge_type: "contains".to_string(),
                             confidence: 1.0,
                             valid_from: now.clone(),
+                            resolution: "contains".to_string(),
                         };
                         store.insert_symbol_edge(&edge).await?;
                     }
                 }
             }
+        }
+    }
+
+    // Pass 2b: resolve and insert call / import / type edges.
+    for pf in &pending {
+        let mut closed_stale: std::collections::HashSet<Uuid> =
+            std::collections::HashSet::new();
+
+        // Local `(scope, var) -> type name` bindings for receiver-type resolution.
+        let binding_type: std::collections::HashMap<(&str, &str), &str> = pf
+            .bindings
+            .iter()
+            .map(|b| ((b.scope.as_str(), b.var.as_str()), b.type_name.as_str()))
+            .collect();
+
+        for raw in &pf.raw_edges {
+            let from_id = match pf.local_ids.get(&raw.from_name) {
+                Some(id) => *id,
+                None => continue,
+            };
+
+            // Close stale edges once per source symbol (not once per edge).
+            if closed_stale.insert(from_id) {
+                store.close_stale_edges_for_symbol(from_id, &now).await?;
+            }
+
+            let mut resolved_to: Option<Uuid> = None;
+            let mut confidence: f64 = 0.3;
+            let mut resolution: &str = "unresolved";
+
+            // Tier 1: same-file exact match (0.95).
+            if let Some(tid) = pf.local_ids.get(&raw.to_name) {
+                resolved_to = Some(*tid);
+                confidence = 0.95;
+                resolution = "same-file";
+            }
+
+            // Tier 2: receiver-type — `recv` is a local var of a known type; look
+            // up `to_name` as a member of that type via `contains` edges (0.9).
+            if resolved_to.is_none() && raw.edge_type == "calls" {
+                if let Some(recv) = raw.recv.as_deref() {
+                    if let Some(ty) = binding_type.get(&(raw.from_name.as_str(), recv)) {
+                        if let Ok(Some(tid)) = store
+                            .find_symbol_id_by_type_and_name(repo.id, ty, &raw.to_name)
+                            .await
+                        {
+                            resolved_to = Some(tid);
+                            confidence = 0.9;
+                            resolution = "receiver-type";
+                        }
+                    }
+                }
+            }
+
+            // Tier 3: import — `to_name` was imported into this file (0.9).
+            if resolved_to.is_none() {
+                if let Some((fid, sid)) =
+                    imports_map.get(&(pf.file_id, raw.to_name.clone())).copied()
+                {
+                    if let Some(sid) = sid {
+                        resolved_to = Some(sid);
+                        confidence = 0.9;
+                        resolution = "import";
+                    } else if let Some(fid) = fid {
+                        if let Ok(Some(sym_id)) =
+                            store.find_symbol_id_in_file(fid, &raw.to_name).await
+                        {
+                            resolved_to = Some(sym_id);
+                            confidence = 0.9;
+                            resolution = "import";
+                        }
+                    }
+                }
+            }
+
+            // Tier 4: module-path spec carried on the edge itself (0.8).
+            if resolved_to.is_none() {
+                if let Some(ref spec) = raw.to_file {
+                    if let Some(fid) =
+                        resolve_spec_to_file(store, repo.id, &pf.rel, spec).await
+                    {
+                        if let Ok(Some(sym_id)) =
+                            store.find_symbol_id_in_file(fid, &raw.to_name).await
+                        {
+                            resolved_to = Some(sym_id);
+                            confidence = 0.8;
+                            resolution = "module-path";
+                        }
+                    }
+                }
+            }
+
+            // Tier 5: repo-wide unique name (0.6).
+            if resolved_to.is_none() {
+                if let Ok(Some(tid)) = store
+                    .find_unique_symbol_id_in_repo(repo.id, &raw.to_name)
+                    .await
+                {
+                    resolved_to = Some(tid);
+                    confidence = 0.6;
+                    resolution = "unique-name";
+                }
+            }
+
+            let edge = SymbolEdge {
+                id: Uuid::new_v4(),
+                repo_id: repo.id,
+                from_id,
+                to_id: resolved_to,
+                to_name: Some(raw.to_name.clone()),
+                edge_type: raw.edge_type.to_string(),
+                confidence,
+                valid_from: now.clone(),
+                resolution: resolution.to_string(),
+            };
+            store.insert_symbol_edge(&edge).await?;
         }
     }
 
@@ -455,7 +692,9 @@ pub async fn run(
                 .find_unique_symbol_id_in_repo(repo.id, &to_name)
                 .await
             {
-                let _ = store.resolve_symbol_edge(edge_id, to_id, 0.75).await;
+                let _ = store
+                    .resolve_symbol_edge(edge_id, to_id, 0.6, "unique-name")
+                    .await;
             }
         }
     }
@@ -464,17 +703,20 @@ pub async fn run(
 
     let mut resp = ArchResponse::empty();
     let communities_detected = detect_and_persist_communities(store, repo.id, &now).await?;
-    if communities_detected > 0 {
-        resp.answer = Some(format!(
-            "Processed {} file(s) for symbols ({} unchanged, skipped). Detected {} communit(y/ies).",
-            processed, skipped, communities_detected
-        ));
-    } else {
-        resp.answer = Some(format!(
-            "Processed {} file(s) for symbols ({} unchanged, skipped).",
-            processed, skipped
+    let mut answer = format!(
+        "Processed {} file(s) for symbols ({} unchanged, skipped).",
+        processed, skipped
+    );
+    if refreshed > 0 {
+        answer.push_str(&format!(
+            " Re-resolved edges in {} unchanged file(s) whose targets changed name counts.",
+            refreshed
         ));
     }
+    if communities_detected > 0 {
+        answer.push_str(&format!(" Detected {} communit(y/ies).", communities_detected));
+    }
+    resp.answer = Some(answer);
 
     if let Some(ref tx) = progress_tx {
         let _ = tx.send(format!(
@@ -513,14 +755,15 @@ async fn ingest_routes(
             Err(_) => continue,
         };
         let routes = crate::adapters::routes::extract_routes_for_extension(&file.ext, &content);
+        // Close first: a file whose last route was removed must not keep it open.
+        store
+            .close_stale_routes_for_file(repo_id, &file.rel, now)
+            .await?;
         if routes.is_empty() {
             continue;
         }
 
         let file_id = store.upsert_file(repo_id, &file.rel, now, now).await?;
-        store
-            .close_stale_routes_for_file(repo_id, &file.rel, now)
-            .await?;
         for route in &routes {
             let handler_id = if let Some(ref handler_name) = route.handler_name {
                 store
@@ -530,6 +773,13 @@ async fn ingest_routes(
                     .flatten()
             } else {
                 None
+            };
+            let resolution = if route.handler_name.is_none() {
+                "no-handler"
+            } else if handler_id.is_some() {
+                "handler-in-file"
+            } else {
+                "handler-unresolved"
             };
             store
                 .insert_route(
@@ -543,6 +793,7 @@ async fn ingest_routes(
                     route.line as i64,
                     1.0,
                     now,
+                    resolution,
                 )
                 .await?;
         }
@@ -619,7 +870,20 @@ async fn detect_and_persist_communities(
     Ok(communities.len())
 }
 
-fn is_ignored_entry(path: &std::path::Path, repo_root: &std::path::Path, gitignore: Option<&Gitignore>) -> bool {
+/// The repository's `.archignore` (gitignore syntax), if it has one.
+pub(crate) fn load_archignore(repo_root: &std::path::Path) -> Result<Option<Gitignore>, ignore::Error> {
+    let path = repo_root.join(".archignore");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let mut builder = GitignoreBuilder::new(repo_root);
+    builder.add(path);
+    builder.build().map(Some)
+}
+
+/// Whether ingest skips `path`: build/artifact directories, agent state, and
+/// anything `.archignore` excludes.
+pub(crate) fn is_ignored_entry(path: &std::path::Path, repo_root: &std::path::Path, gitignore: Option<&Gitignore>) -> bool {
     // Ignore non-directories only when patterns match the relative path; directories
     // with certain names are always ignored.
     if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
@@ -1142,7 +1406,7 @@ pub fn caller() -> u32 { callee() }
 
         // Write .archignore as in user's file
         let arch = r#".*/
-!.agents/weaver/SKILL.md
+!docs/guide.md
 !migrations/
 !migrations/**
 !src/
@@ -1306,6 +1570,93 @@ impl Foo {
         .get("cnt");
 
         assert!(count >= 1, "expected at least 1 contains edge, got {}", count);
+
+        Ok(())
+    }
+
+    /// Cross-file TS: a method call on a locally-constructed object resolves via
+    /// the `receiver-type` tier; a call to an imported free function resolves via
+    /// the `import` tier.
+    #[tokio::test]
+    async fn ingest_symbols_scoped_resolution_tiers() -> TestResult {
+        let td = tempdir()?;
+        let repo_path = td.path().join("repo");
+        fs::create_dir_all(repo_path.join("src"))?;
+
+        fs::write(
+            repo_path.join("src").join("service.ts"),
+            "export class Service {\n  start() { return 1; }\n}\n",
+        )?;
+        fs::write(
+            repo_path.join("src").join("util.ts"),
+            "export function helper() { return 2; }\n",
+        )?;
+        fs::write(
+            repo_path.join("src").join("app.ts"),
+            concat!(
+                "import { Service } from './service';\n",
+                "import { helper } from './util';\n",
+                "export function boot() {\n",
+                "  const s = new Service();\n",
+                "  s.start();\n",
+                "  helper();\n",
+                "}\n",
+            ),
+        )?;
+
+        let db_path = td.path().join("memory.db");
+        let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
+        let store = SqliteStore::connect(&db_url).await?;
+        store.run_migrations().await?;
+        let store = Arc::new(store);
+
+        run(
+            &store,
+            IngestSymbolsParams {
+                repo_path: repo_path.to_string_lossy().to_string(),
+                pattern: None,
+                force: false,
+            },
+            None,
+            None,
+        )
+        .await?;
+
+        use sqlx::Row;
+        let pool = sqlx::SqlitePool::connect(&db_url).await?;
+
+        let row = |to_name: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query(
+                    r#"SELECT se.resolution AS resolution, se.confidence AS confidence
+                       FROM symbol_edges se
+                       JOIN symbols sf ON sf.id = se.from_id
+                       WHERE sf.name = 'boot' AND se.edge_type = 'calls'
+                         AND se.to_name = ? AND se.valid_to IS NULL
+                       LIMIT 1"#,
+                )
+                .bind(to_name)
+                .fetch_optional(&pool)
+                .await
+            }
+        };
+
+        let start = row("start").await?.expect("boot -> start edge");
+        assert_eq!(start.get::<String, _>("resolution"), "receiver-type");
+        assert!(start.get::<f64, _>("confidence") >= 0.9);
+
+        let helper = row("helper").await?.expect("boot -> helper edge");
+        assert_eq!(helper.get::<String, _>("resolution"), "import");
+
+        // file_imports table populated for app.ts
+        let imports: i64 = sqlx::query(
+            "SELECT COUNT(*) AS c FROM file_imports WHERE to_file_id IS NOT NULL AND valid_to IS NULL",
+        )
+        .fetch_one(&pool)
+        .await?
+        .get("c");
+        assert!(imports >= 2, "expected >=2 resolved file_imports, got {imports}");
 
         Ok(())
     }

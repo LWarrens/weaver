@@ -5,11 +5,12 @@
 //! must equal the projection produced by a full re-sync from scratch. This tool
 //! rebuilds the ADR lane in a throwaway in-memory store and diffs the two
 //! projections. It is deliberately off the hot path — run it in CI or manually,
-//! never inside a query.
+//! never inside a query. The rebuild makes no provider calls (REQ-058).
 //!
-//! Only the ADR lane is audited here: it is the one lane whose incremental and
-//! full paths share no code and can therefore diverge. Symbol/commit lanes are
-//! reported as `not_audited`.
+//! Two lanes are audited: ADR, and symbol (symbols, call-graph edges, file
+//! imports, routes). These are the lanes `sync_incremental` maintains
+//! incrementally, so they are the ones that can drift from a full rebuild. The
+//! commit lane has no incremental path and is reported `not_audited`.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -21,6 +22,7 @@ use crate::domain::anchors::normalize_ws;
 use crate::domain::entities::{AnchorSource, Claim};
 use crate::error::Error;
 use crate::storage::SqliteStore;
+use crate::tools::ingest_symbols::{self, IngestSymbolsParams};
 use crate::tools::sync_adrs::{self, SyncAdrsFromGitParams};
 
 // ---------------------------------------------------------------------------
@@ -34,6 +36,11 @@ pub struct VerifyIndexIntegrityParams {
     /// Glob for ADR files relative to the repo root. Default: `docs/adr/*.md`.
     #[serde(default = "default_adr_glob")]
     pub adr_glob: String,
+    /// Glob for source files relative to the repo root, matching the `pattern`
+    /// the live symbol index was built with. Default: all supported files. A
+    /// live index built with a narrower pattern reads as divergent.
+    #[serde(default)]
+    pub symbol_glob: Option<String>,
 }
 
 fn default_adr_glob() -> String {
@@ -45,11 +52,17 @@ pub struct LaneIntegrity {
     pub lane: String,
     /// `clean`, `divergent`, or `not_audited`.
     pub status: String,
-    pub live_claims: usize,
-    pub rebuilt_claims: usize,
-    /// Projection keys present live but not in a full re-sync (stale rows).
+    /// Why a lane is `not_audited`, when there is something to say beyond
+    /// "this lane has no incremental path".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    pub live_facts: usize,
+    pub rebuilt_facts: usize,
+    /// Projection keys present live more often than in a full re-sync (stale
+    /// rows). A key present in both with different counts reads `key (xN vs xM)`.
     pub only_in_live: Vec<String>,
-    /// Projection keys a full re-sync produces that the live index is missing.
+    /// Projection keys a full re-sync produces more often than the live index
+    /// (missing rows), formatted like `only_in_live`.
     pub only_in_rebuild: Vec<String>,
 }
 
@@ -79,13 +92,32 @@ fn projection_key(claim: &Claim, anchor_hashes: &[String]) -> String {
     )
 }
 
-/// Build the multiset of projection keys for every open ADR-sourced claim.
+/// Keys whose count in `a` exceeds their count in `b`.
+fn surplus(a: &BTreeMap<String, usize>, b: &BTreeMap<String, usize>) -> Vec<String> {
+    a.iter()
+        .filter_map(|(key, &n)| {
+            let m = b.get(key).copied().unwrap_or(0);
+            match (n > m, m) {
+                (false, _) => None,
+                (true, 0) => Some(key.clone()),
+                (true, _) => Some(format!("{key} (x{n} vs x{m})")),
+            }
+        })
+        .collect()
+}
+
+/// Build the multiset of projection keys for the ADR lane: every open
+/// ADR-sourced claim, plus the ADR documents, supersession edges, code links, and
+/// temporal edges that ADR sync declares.
 async fn adr_projection(
     store: &SqliteStore,
     repo_id: uuid::Uuid,
 ) -> Result<BTreeMap<String, usize>, Error> {
     let claims = store.open_claims_for_repo(repo_id).await?;
     let mut out: BTreeMap<String, usize> = BTreeMap::new();
+    for fact in store.adr_declared_facts(repo_id).await? {
+        *out.entry(fact).or_insert(0) += 1;
+    }
     for claim in &claims {
         let anchors = store.anchors_for_claim(claim.id).await?;
         let adr_hashes: Vec<String> = anchors
@@ -99,6 +131,50 @@ async fn adr_projection(
         *out.entry(projection_key(claim, &adr_hashes)).or_insert(0) += 1;
     }
     Ok(out)
+}
+
+/// Multiset of the symbol lane's declared facts.
+async fn symbol_projection(
+    store: &SqliteStore,
+    repo_id: uuid::Uuid,
+) -> Result<BTreeMap<String, usize>, Error> {
+    let mut out: BTreeMap<String, usize> = BTreeMap::new();
+    for fact in store.symbol_declared_facts(repo_id).await? {
+        *out.entry(fact).or_insert(0) += 1;
+    }
+    Ok(out)
+}
+
+/// Diff a live projection against its rebuild into one lane report.
+fn lane_report(
+    lane: &str,
+    live: &BTreeMap<String, usize>,
+    rebuilt: &BTreeMap<String, usize>,
+) -> LaneIntegrity {
+    let only_in_live = surplus(live, rebuilt);
+    let only_in_rebuild = surplus(rebuilt, live);
+    let clean = only_in_live.is_empty() && only_in_rebuild.is_empty();
+    LaneIntegrity {
+        lane: lane.to_string(),
+        status: if clean { "clean" } else { "divergent" }.to_string(),
+        note: None,
+        live_facts: live.values().sum(),
+        rebuilt_facts: rebuilt.values().sum(),
+        only_in_live,
+        only_in_rebuild,
+    }
+}
+
+fn not_audited(lane: &str, note: Option<&str>) -> LaneIntegrity {
+    LaneIntegrity {
+        lane: lane.to_string(),
+        status: "not_audited".to_string(),
+        note: note.map(str::to_string),
+        live_facts: 0,
+        rebuilt_facts: 0,
+        only_in_live: vec![],
+        only_in_rebuild: vec![],
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -128,61 +204,62 @@ pub async fn run(
     let mut warnings: Vec<String> = Vec::new();
     let scratch_repo = scratch.upsert_repository(repo_path_str, None).await?;
 
-    if let Err(e) = sync_adrs::run(
+    if let Err(e) = crate::embeddings::without_provider(sync_adrs::run(
         &scratch,
         SyncAdrsFromGitParams {
             repo_path: repo_path_str.to_string(),
             adr_glob: params.adr_glob.clone(),
         },
-    )
+    ))
     .await
     {
         warnings.push(format!("full re-sync failed: {e}"));
     }
     let rebuilt = adr_projection(&scratch, scratch_repo.id).await?;
 
-    let only_in_live: Vec<String> = live
-        .keys()
-        .filter(|k| !rebuilt.contains_key(*k))
-        .cloned()
-        .collect();
-    let only_in_rebuild: Vec<String> = rebuilt
-        .keys()
-        .filter(|k| !live.contains_key(*k))
-        .cloned()
-        .collect();
+    let mut lanes = vec![lane_report("adr", &live, &rebuilt)];
 
-    let adr_clean = only_in_live.is_empty() && only_in_rebuild.is_empty();
-    let lanes = vec![
-        LaneIntegrity {
-            lane: "adr".to_string(),
-            status: if adr_clean { "clean" } else { "divergent" }.to_string(),
-            live_claims: live.values().sum(),
-            rebuilt_claims: rebuilt.values().sum(),
-            only_in_live,
-            only_in_rebuild,
-        },
-        LaneIntegrity {
-            lane: "symbol".to_string(),
-            status: "not_audited".to_string(),
-            live_claims: 0,
-            rebuilt_claims: 0,
-            only_in_live: vec![],
-            only_in_rebuild: vec![],
-        },
-        LaneIntegrity {
-            lane: "commit".to_string(),
-            status: "not_audited".to_string(),
-            live_claims: 0,
-            rebuilt_claims: 0,
-            only_in_live: vec![],
-            only_in_rebuild: vec![],
-        },
-    ];
+    // The symbol lane is only audited when the live index has one: a repo that
+    // was never symbol-indexed would otherwise read as wholly divergent.
+    let symbol_indexed = store
+        .index_lanes(repo.id)
+        .await?
+        .iter()
+        .any(|l| l.lane == "symbol");
+    if symbol_indexed {
+        let live_symbols = symbol_projection(store, repo.id).await?;
+        let rebuilt_symbols = match crate::embeddings::without_provider(ingest_symbols::run(
+            &scratch,
+            IngestSymbolsParams {
+                repo_path: repo_path_str.to_string(),
+                pattern: params.symbol_glob.clone(),
+                force: false,
+            },
+            None,
+            None,
+        ))
+        .await
+        {
+            Ok(_) => Some(symbol_projection(&scratch, scratch_repo.id).await?),
+            Err(e) => {
+                warnings.push(format!("symbol full re-index failed: {e}"));
+                None
+            }
+        };
+        lanes.push(match rebuilt_symbols {
+            Some(rebuilt_symbols) => lane_report("symbol", &live_symbols, &rebuilt_symbols),
+            None => not_audited("symbol", Some("full re-index failed; see warnings")),
+        });
+    } else {
+        lanes.push(not_audited("symbol", Some("live index has no symbol lane")));
+    }
+    lanes.push(not_audited("commit", None));
+
+    let consistent = lanes.iter().all(|l| l.status != "divergent");
 
     Ok(VerifyIndexIntegrityResult {
         repo_path: repo_path_str.to_string(),
-        consistent: adr_clean,
+        consistent,
         lanes,
         warnings,
     })
@@ -232,6 +309,7 @@ mod tests {
             VerifyIndexIntegrityParams {
                 repo_path: repo.to_string_lossy().to_string(),
                 adr_glob: "docs/adr/*.md".to_string(),
+                symbol_glob: None,
             },
         )
         .await
@@ -240,7 +318,69 @@ mod tests {
         assert!(res.consistent, "lanes: {:#?}", res.lanes);
         let adr = res.lanes.iter().find(|l| l.lane == "adr").unwrap();
         assert_eq!(adr.status, "clean");
-        assert!(adr.live_claims > 0);
+        assert!(adr.live_facts > 0);
+    }
+
+    /// REQ-058: the scratch rebuild is offline. With an embedding provider
+    /// configured, it must not open a single connection to it.
+    #[tokio::test]
+    async fn rebuild_makes_no_embedding_calls() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let td = tempdir().unwrap();
+        let repo = td.path().join("repo");
+        fs::create_dir_all(repo.join("docs/adr")).unwrap();
+        git2::Repository::init(&repo).unwrap();
+        fs::write(
+            repo.join("docs/adr/0001-x.md"),
+            "# ADR-0001: X\n\n## Status\nAccepted\n\n## Context\nc\n\n## Decision\nServices must use the bus.\n",
+        )
+        .unwrap();
+
+        let _guard = crate::env_guard();
+        let store = store().await;
+        let params = || SyncAdrsFromGitParams {
+            repo_path: repo.to_string_lossy().to_string(),
+            adr_glob: "docs/adr/*.md".to_string(),
+        };
+        // The live sync runs with no provider; only the oracle's rebuild is under test.
+        sync_adrs::run(&store, params()).await.unwrap();
+
+        // A fake Ollama endpoint that counts connections and drops them.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let connections = Arc::new(AtomicUsize::new(0));
+        let counter = connections.clone();
+        let server = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                counter.fetch_add(1, Ordering::SeqCst);
+                drop(stream);
+            }
+        });
+        std::env::set_var("WEAVER_EMBEDDING_PROVIDER", "ollama");
+        std::env::set_var("WEAVER_EMBEDDING_URL", &url);
+
+        let res = run(
+            &store,
+            VerifyIndexIntegrityParams {
+                repo_path: repo.to_string_lossy().to_string(),
+                adr_glob: "docs/adr/*.md".to_string(),
+                symbol_glob: None,
+            },
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        std::env::remove_var("WEAVER_EMBEDDING_PROVIDER");
+        std::env::remove_var("WEAVER_EMBEDDING_URL");
+        server.abort();
+
+        assert!(res.unwrap().consistent);
+        assert_eq!(
+            connections.load(Ordering::SeqCst),
+            0,
+            "oracle rebuild called the embedding provider"
+        );
     }
 
     #[tokio::test]
@@ -279,12 +419,17 @@ mod tests {
             VerifyIndexIntegrityParams {
                 repo_path: repo.to_string_lossy().to_string(),
                 adr_glob: "docs/adr/*.md".to_string(),
+                symbol_glob: None,
             },
         )
         .await
         .unwrap();
 
-        assert!(!res.consistent, "expected divergence, lanes: {:#?}", res.lanes);
+        assert!(
+            !res.consistent,
+            "expected divergence, lanes: {:#?}",
+            res.lanes
+        );
         let adr_lane = res.lanes.iter().find(|l| l.lane == "adr").unwrap();
         assert_eq!(adr_lane.status, "divergent");
         assert!(!adr_lane.only_in_live.is_empty());

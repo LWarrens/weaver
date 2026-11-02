@@ -42,6 +42,7 @@
     file: "#6ee7ff", // cyan
     symbol: "#89f0a7", // green
     commit: "#8fa8c8", // muted blue
+    pull_request: "#a78bfa", // violet — merge/squash unit that landed commits
     constraint: "#f4845f", // coral
   };
 
@@ -54,6 +55,8 @@
     links_to: "#f5a623",
     references: "#89f0a7",
     references_commit: "#8fa8c8",
+    references_pr: "#a78bfa", // decision → pull request
+    includes: "#a78bfa", // pull request → merge commit
     modifies: "#8fa8c8",
     implements: "#c8a6f5",
     extends: "#e0c0ff",
@@ -232,6 +235,8 @@
     links_to: 38,
     references: 38,
     references_commit: 34,
+    references_pr: 34,
+    includes: 30,
     modifies: 34,
     implements: 48,
     extends: 48,
@@ -525,7 +530,7 @@
     return kind === "decision" || kind === "lead" || kind === "constraint" || row.relation.includes("mention") || row.relation.includes("reference");
   });
 
-  $: selectedHistoryRows = selectedRelationRows.filter((row) => row.other?.kind === "commit" || row.relation.includes("modif") || row.relation.includes("co_change"));
+  $: selectedHistoryRows = selectedRelationRows.filter((row) => row.other?.kind === "commit" || row.other?.kind === "pull_request" || row.relation.includes("modif") || row.relation.includes("co_change"));
 
   $: visibleEdgeCount = displayGraph.links.filter(
     (link) => visibleEdgeTypes[link.edge_type] ?? false,
@@ -1643,6 +1648,12 @@
         on:click={() =>
           runTool("sync_commits_from_git", { repo_path: repoPath })}
         disabled={running}>Sync commits</button
+      >
+      <button
+        on:click={() => runTool("sync_prs_from_git", { repo_path: repoPath })}
+        disabled={running}
+        title="Derive pull requests from merge/squash commits (run after Sync commits)"
+        >Sync PRs</button
       >
       <button
         on:click={() => runTool("sync_adrs_from_git", { repo_path: repoPath })}

@@ -1,0 +1,25 @@
+%%{init: {"theme": "neutral", "themeVariables": {"fontSize": "16px"}}}%%
+flowchart TB
+    CLAIM["<b>Claim</b><br/>evidence_grade: unknown / partial / proven<br/><i>set once at ingest</i>"]
+
+    CLAIM --> HASH{"<b>Re-hash cited spans</b><br/>against the working tree"}
+
+    HASH -->|"all citations hash clean"| UNAFF["<b>disposition: unaffected</b>"]
+    HASH -->|"stale citations relocated"| AFF["<b>disposition: affected</b>"]
+    HASH -->|"citation moved, not found again<br/>or never anchored"| UNPROV["<b>disposition: unprovable</b><br/><i>terminal - not 'low confidence'</i>"]
+
+    UNAFF --> ANS(["normal answer"])
+    AFF --> ANS
+
+    UNPROV --> STRICT{"<b>verify: strict</b><br/>and in scope?"}
+    STRICT -->|no| ANS
+    STRICT -->|yes| REF(["<b>refused</b> + rebuild obligation<br/><i>stale anchors + sync command</i>"])
+
+    style CLAIM fill:#dbe9f6,stroke:#5b7fa6
+    style HASH fill:#f7e6c4,stroke:#b8934a
+    style STRICT fill:#f7e6c4,stroke:#b8934a
+    style UNAFF fill:#dcecdc,stroke:#5f9e6e
+    style AFF fill:#dcecdc,stroke:#5f9e6e
+    style UNPROV fill:#f6d9c4,stroke:#b06a3a
+    style ANS fill:#dcecdc,stroke:#5f9e6e
+    style REF fill:#f6d9c4,stroke:#b06a3a

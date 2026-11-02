@@ -241,6 +241,7 @@ pub async fn run(
                 store
                     .insert_decision_git_link(
                         &decision.id,
+                        "commit",
                         &commit_id,
                         0.95,
                         source_time,
@@ -276,6 +277,7 @@ pub async fn run(
                     store
                         .insert_decision_git_link(
                             &decision.id,
+                            "commit",
                             &commit_id,
                             0.6,
                             source_time,
@@ -546,9 +548,9 @@ fn diff_symbols(before: Vec<Symbol>, after: Vec<Symbol>) -> RawSymbolDiff {
     RawSymbolDiff { added, removed }
 }
 
-/// Extract ADR ID references from commit message text.
-/// Matches "ADR-0042", "ADR 42", etc.
-fn extract_adr_refs(text: &str) -> Vec<String> {
+/// Extract ADR ID references from commit or pull request text.
+/// Matches "ADR-0042", "ADR 42", etc. Shared with `sync_prs`.
+pub(crate) fn extract_adr_refs(text: &str) -> Vec<String> {
     let mut refs = vec![];
     let upper = text.to_uppercase();
     let mut pos = 0;

@@ -34,6 +34,7 @@ use crate::tools::{
     check_consistency::CheckConsistencyParams,
     find_stale_decisions::FindStaleDecisionsParams,
     propose_links::ProposeLinksParams,
+    dedup_decisions::DedupDecisionsParams,
     retract::RetractParams,
     trace_symbol_history::TraceSymbolHistoryParams,
     architecture_query::ArchQueryParams,
@@ -53,6 +54,7 @@ use crate::tools::{
     ingest_symbols::IngestSymbolsParams, inspect_change::InspectChangeParams,
     record_episode::RecordDecisionEpisodeParams, sync_adrs::SyncAdrsFromGitParams,
     sync_commits::SyncCommitsFromGitParams,
+    sync_prs::SyncPrsFromGitParams,
     trace_call_path::TraceCallPathParams,
     validate_adr::ValidateAdrParams,
     focused_file_brief::FileBriefParams,
@@ -172,6 +174,26 @@ impl ArchServer {
         Parameters(params): Parameters<SyncCommitsFromGitParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let result = crate::tools::sync_commits::run(&self.store, params)
+            .await
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+
+        let value = serde_json::to_value(&result).unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()));
+        let content = Content::json(value).map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        Ok(CallToolResult::success(vec![content]))
+    }
+
+    /// Derive pull requests from git merge/squash history and ingest them.
+    /// Links PRs to decisions by ADR ID reference or keyword overlap, and
+    /// enriches them from the GitHub API when a token is configured.
+    #[tool(
+        name = "sync_prs_from_git",
+        description = "Ingest pull requests derived from git merge/squash history, optionally enriched from the GitHub API, and link them to related decisions."
+    )]
+    async fn sync_prs_from_git(
+        &self,
+        Parameters(params): Parameters<SyncPrsFromGitParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let result = crate::tools::sync_prs::run(&self.store, params)
             .await
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
@@ -842,6 +864,24 @@ impl ArchServer {
         Ok(CallToolResult::success(vec![Content::text(text)]))
     }
 
+    /// Fold duplicate episode-sourced decisions into the decision they repeat,
+    /// after the fact. Dry run by default; matching uses stored embeddings only.
+    #[tool(
+        name = "dedup_decisions",
+        description = "Find and merge duplicate episode-sourced decisions that predate ingest-time dedup. Dry run by default (dry_run=false applies). Matches by normalized text or stored-embedding similarity; makes no provider calls. Soft-closes the duplicate and moves its constraints and links to the survivor."
+    )]
+    async fn dedup_decisions(
+        &self,
+        Parameters(params): Parameters<DedupDecisionsParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let result = crate::tools::dedup_decisions::run(&self.store, params)
+            .await
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+
+        let text = serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string());
+        Ok(CallToolResult::success(vec![Content::text(text)]))
+    }
+
     /// Suggest candidate links between a target ADR or decision and related
     /// commits, symbols, decisions, and routes. All candidates are non-authoritative
     /// and include an explicit confidence score; none are promoted automatically.
@@ -966,7 +1006,7 @@ impl ArchServer {
     /// index. Off the hot path — for CI or manual auditing, not queries.
     #[tool(
         name = "verify_index_integrity",
-        description = "Audit index integrity: rebuild the ADR lane from scratch and diff it against the live index. Reports per-lane clean/divergent/not_audited plus the diverging claim projections. Run in CI, not on the query path."
+        description = "Audit index integrity: rebuild the ADR and symbol lanes from scratch and diff them against the live index. Reports per-lane clean/divergent/not_audited plus the diverging projection keys. Run in CI, not on the query path."
     )]
     async fn verify_index_integrity(
         &self,
@@ -1004,7 +1044,7 @@ impl ServerHandler for ArchServer {
                 String::from("")
                     + "architectural informant. "
                     + "ORIENT: index_status(repo) → get_architecture(repo) → get_graph_schema; "
-                    + "INGEST: sync_adrs_from_git → ingest_symbols (background, poll ingest_symbols_status) → sync_commits_from_git → embed_all; "
+                    + "INGEST: sync_adrs_from_git → ingest_symbols (background, poll ingest_symbols_status) → sync_commits_from_git → sync_prs_from_git → embed_all; "
                     + "sync_incremental for incremental CI runs; "
                     + "QUERY: query(text) keyword+semantic search; find_decisions_for_code(file/symbol) governance lookup; explain_answer for retrieval provenance; "
                     + "ANALYSE: inspect_change_against_decisions(files) constraint check; impact_of(decision_id) BFS impact; trace_call_path(from,to) call graph; "

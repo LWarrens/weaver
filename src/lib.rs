@@ -9,6 +9,7 @@ pub mod daemon;
 pub mod domain;
 pub mod embeddings;
 pub mod error;
+pub mod github;
 pub mod llm;
 pub mod server;
 pub mod storage;

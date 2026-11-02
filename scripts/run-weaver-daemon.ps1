@@ -13,7 +13,11 @@
 [CmdletBinding()]
 param(
     [string]$Bind             = $env:WEAVER_BIND             ?? '127.0.0.1:8444',
-    [string]$Db               = $env:WEAVER_DB,
+    # Named DbPath, not Db: [CmdletBinding()] auto-generates common parameters
+    # including -Debug, and PowerShell's binder rejects a custom parameter
+    # whose name is an ambiguous abbreviation of one ("Db" prefixes "Debug"),
+    # erroring on every invocation of this script, even with zero arguments.
+    [string]$DbPath           = $env:WEAVER_DB,
     [string]$EmbeddingProvider = $env:WEAVER_EMBEDDING_PROVIDER ?? 'lmstudio',
     [string]$EmbeddingUrl      = $env:WEAVER_EMBEDDING_URL      ?? 'http://localhost:1234',
     [string]$EmbeddingModel    = $env:WEAVER_EMBEDDING_MODEL    ?? 'text-embedding-harrier-oss-v1-270m',
@@ -27,7 +31,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 
-if (-not $Db)     { $Db = Join-Path $root 'arch.db' }
+if (-not $DbPath) { $DbPath = Join-Path $root 'arch.db' }
 if (-not $LogDir) { $LogDir = Join-Path $root 'logs' }
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 
@@ -52,7 +56,7 @@ if (Test-Path $configFile) {
 } else {
     Write-Host "Starting weaver with explicit flags -> $log"
     $args = @(
-        '--db', $Db,
+        '--db', $DbPath,
         '--daemon', '--bind', $Bind,
         '--embedding-provider', $EmbeddingProvider,
         '--embedding-url', $EmbeddingUrl,

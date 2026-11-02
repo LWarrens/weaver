@@ -1,0 +1,19 @@
+%%{init: {"theme": "neutral", "themeVariables": {"fontSize": "16px"}}}%%
+flowchart LR
+    C["<b>Code</b><br/>source symbols<br/><i>what exists</i>"]
+    G["<b>Git</b><br/>commit history<br/><i>what changed</i>"]
+    A["<b>ADRs</b><br/>docs/adr/*.md<br/><i>why it was decided</i>"]
+
+    C --> DB
+    G --> DB
+    A --> DB
+
+    DB[("<b>weaver</b> - bitemporal SQLite<br/>every fact tagged: when true ·<br/>when learned · how confident<br/>supersession edges, history closed")]
+
+    DB --> OUT(["<b>Answer + evidence + freshness verdict</b><br/>ADR section · commit · symbol span,<br/>checked against your working tree"])
+
+    style C fill:#dbe9f6,stroke:#5b7fa6
+    style G fill:#dbe9f6,stroke:#5b7fa6
+    style A fill:#dbe9f6,stroke:#5b7fa6
+    style DB fill:#f7e6c4,stroke:#b8934a
+    style OUT fill:#dcecdc,stroke:#5f9e6e

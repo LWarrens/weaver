@@ -164,6 +164,7 @@
                 edge_type: "calls".to_string(),
                 confidence: 0.95,
                 valid_from: now.to_string(),
+                resolution: "same-file".to_string(),
             })
             .await
             .expect("symbol edge");
@@ -461,4 +462,201 @@
         assert_eq!(found[0].adr_id, format!("episode:{}", episode_id));
         assert_eq!(found[0].title, "Direct episode link");
         assert_eq!(found[0].status, "episode");
+    }
+
+    #[tokio::test]
+    async fn pull_requests_are_counted_and_backfilled_for_embeddings() {
+        let store = test_store().await;
+        let repo = store
+            .upsert_repository("C:/repo/pr-status", None)
+            .await
+            .expect("repo");
+
+        for (pr_ref, title, body) in [
+            ("41", Some("Adopt SQLite"), Some("Replaces the file store.")),
+            ("42", Some("Title only"), None),
+            ("43", None, None),
+        ] {
+            store
+                .insert_pull_request(
+                    repo.id,
+                    pr_ref,
+                    pr_ref.parse().ok(),
+                    title,
+                    body,
+                    None,
+                    None,
+                    Some("merged"),
+                    None,
+                    "git",
+                    "2026-05-05T09:00:00Z",
+                    "2026-05-05T09:01:00Z",
+                )
+                .await
+                .expect("insert pr");
+        }
+
+        let counts = store.index_status_counts(repo.id).await.expect("counts");
+        assert_eq!(counts.prs_total, 3);
+        assert_eq!(counts.prs_embedded, 0);
+        assert_eq!(
+            counts.prs_last_ingested_at.as_deref(),
+            Some("2026-05-05T09:01:00Z")
+        );
+
+        let mut pending = store
+            .fetch_pull_requests_without_embeddings(repo.id)
+            .await
+            .expect("pending");
+        assert_eq!(pending.len(), 3);
+        pending.sort_by(|a, b| a.1.cmp(&b.1));
+        // Empty text is returned as-is; embed_all skips it rather than failing.
+        assert_eq!(pending[0].1, "");
+        assert_eq!(pending[1].1, "Adopt SQLite\nReplaces the file store.");
+        assert_eq!(pending[2].1, "Title only");
+
+        store
+            .update_pull_request_embedding(&pending[1].0, &[0u8; 8])
+            .await
+            .expect("embed");
+
+        let counts = store.index_status_counts(repo.id).await.expect("counts");
+        assert_eq!(counts.prs_embedded, 1);
+        let pending = store
+            .fetch_pull_requests_without_embeddings(repo.id)
+            .await
+            .expect("pending");
+        assert_eq!(pending.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn graph_snapshot_includes_pull_requests_linked_to_decisions_and_commits() {
+        let store = test_store().await;
+        let repo = store
+            .upsert_repository("C:/repo/pr-snapshot", None)
+            .await
+            .expect("repo");
+
+        let episode_id = Uuid::new_v4();
+        store
+            .insert_episode(
+                &episode_id,
+                repo.id,
+                "meeting:storage",
+                None,
+                "Episode discussion",
+                "2026-05-05T09:00:00Z",
+                "2026-05-05T09:01:00Z",
+            )
+            .await
+            .expect("episode");
+        let decision = Decision {
+            id: Uuid::new_v4(),
+            title: Some("Adopt SQLite".to_string()),
+            adr_id: None,
+            episode_id: Some(episode_id),
+            text: "SQLite is the source of truth.".to_string(),
+            source_uri: format!("episode:{}", episode_id),
+            valid_from: "2026-05-05T09:01:00Z".to_string(),
+            valid_to: None,
+            ingested_at: "2026-05-05T09:01:00Z".to_string(),
+            source_time: Some("2026-05-05T09:00:00Z".to_string()),
+            confidence: 1.0,
+            evidence_refs: vec![],
+        };
+        store.insert_decision(&decision).await.expect("decision");
+
+        store
+            .insert_commit(
+                repo.id,
+                "abcdef0123456789",
+                Some("dev"),
+                Some("Merge pull request #42"),
+                "2026-05-05T10:00:00Z",
+                "2026-05-05T10:01:00Z",
+            )
+            .await
+            .expect("commit");
+        store
+            .insert_pull_request(
+                repo.id,
+                "42",
+                Some(42),
+                Some("Adopt SQLite"),
+                None,
+                Some("abcdef0123456789"),
+                None,
+                Some("merged"),
+                None,
+                "git",
+                "2026-05-05T10:00:00Z",
+                "2026-05-05T10:01:00Z",
+            )
+            .await
+            .expect("pr");
+        let (pr_id, _) = store
+            .find_pull_request_by_ref(repo.id, "42")
+            .await
+            .expect("find")
+            .expect("pr row");
+        // A second PR with no decision link and no merge commit in the store must not appear.
+        store
+            .insert_pull_request(
+                repo.id,
+                "43",
+                Some(43),
+                Some("Unlinked"),
+                None,
+                Some("0000000000000000"),
+                None,
+                Some("merged"),
+                None,
+                "git",
+                "2026-05-05T10:30:00Z",
+                "2026-05-05T10:31:00Z",
+            )
+            .await
+            .expect("unlinked pr");
+        store
+            .insert_decision_git_link(
+                &decision.id.to_string(),
+                "pr",
+                &pr_id,
+                0.95,
+                "2026-05-05T10:00:00Z",
+                "2026-05-05T10:01:00Z",
+                "git_history",
+            )
+            .await
+            .expect("link");
+
+        let (nodes, edges) = store
+            .fetch_graph_snapshot(repo.id, "2026-05-06T00:00:00Z", Some(10), Some(50))
+            .await
+            .expect("snapshot");
+
+        let pr_nodes: Vec<_> = nodes.iter().filter(|n| n.kind == "pull_request").collect();
+        assert_eq!(pr_nodes.len(), 1, "only the linked PR is in the graph");
+        assert_eq!(pr_nodes[0].id, pr_id);
+        assert_eq!(pr_nodes[0].label, "#42");
+        assert_eq!(pr_nodes[0].detail.as_deref(), Some("Adopt SQLite"));
+
+        assert!(
+            edges.iter().any(|e| e.edge_type == "references_pr"
+                && e.source == decision.id.to_string()
+                && e.target == pr_id),
+            "decision -> PR edge"
+        );
+        let commit_id = nodes
+            .iter()
+            .find(|n| n.kind == "commit")
+            .expect("merge commit node")
+            .id
+            .clone();
+        assert!(
+            edges.iter().any(|e| e.edge_type == "includes"
+                && e.source == pr_id
+                && e.target == commit_id),
+            "PR -> merge commit edge"
+        );
     }

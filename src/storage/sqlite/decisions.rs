@@ -51,6 +51,30 @@ impl SqliteStore {
         .bind(&id_str)
         .execute(&self.pool)
         .await?;
+        // Close what ADR sync declared about those decisions: their code links
+        // and the defines / imposes / mentions edges. Left open, they outlive
+        // the decision and a full re-sync would never reproduce them (REQ-058).
+        sqlx::query(
+            r#"UPDATE decision_code_links SET valid_to = ?
+               WHERE valid_to IS NULL
+                 AND decision_id IN (SELECT id FROM decisions WHERE adr_id = ?)"#,
+        )
+        .bind(valid_to)
+        .bind(&id_str)
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            r#"UPDATE temporal_edges SET valid_to = ?
+               WHERE valid_to IS NULL
+                 AND edge_type IN ('defines', 'imposes', 'mentions')
+                 AND (target_id IN (SELECT id FROM decisions WHERE adr_id = ?)
+                      OR source_id IN (SELECT id FROM decisions WHERE adr_id = ?))"#,
+        )
+        .bind(valid_to)
+        .bind(&id_str)
+        .bind(&id_str)
+        .execute(&self.pool)
+        .await?;
         sqlx::query("UPDATE decisions SET valid_to = ? WHERE adr_id = ?")
             .bind(valid_to)
             .bind(&id_str)
@@ -240,7 +264,6 @@ impl SqliteStore {
         .await?;
         Ok(())
     }
-
 }
 
 impl SqliteStore {
@@ -313,6 +336,175 @@ impl SqliteStore {
     }
 
     /// Relative file paths with an open link to the given decision.
+    /// `(id, text)` of a decision's open constraints.
+    pub async fn open_constraints_for_decision(
+        &self,
+        decision_id: &str,
+    ) -> Result<Vec<(String, String)>, Error> {
+        let rows = sqlx::query_as(
+            "SELECT id, text FROM constraints WHERE decision_id = ? AND valid_to IS NULL",
+        )
+        .bind(decision_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Fold a duplicate episode decision into `survivor` (entity resolution after
+    /// the fact). Everything the loser carries that the survivor lacks moves over:
+    /// the constraints in `move_constraint_ids` (with their `imposes` edges), code
+    /// links to files the survivor is not already linked to, git links, and open
+    /// temporal edges. A `supports` Episode -> Decision edge records the merge,
+    /// as ingest-time dedup does. The loser is then soft-closed with its remaining
+    /// constraints and claims, exactly as `retract` would.
+    ///
+    /// The re-homing runs in one transaction. If the process dies before the
+    /// closing step the loser is still open, and re-running finds the same pair
+    /// and finishes: every step is a no-op the second time.
+    pub async fn merge_decision_into(
+        &self,
+        loser: Uuid,
+        survivor: Uuid,
+        episode_id: &str,
+        similarity: f64,
+        move_constraint_ids: &[String],
+        now: &str,
+    ) -> Result<(), Error> {
+        let (loser_s, survivor_s) = (loser.to_string(), survivor.to_string());
+        let mut tx = self.pool.begin().await?;
+
+        let has_supports: Option<(String,)> = sqlx::query_as(
+            "SELECT id FROM temporal_edges
+              WHERE edge_type = 'supports' AND source_id = ? AND target_id = ?
+                AND valid_to IS NULL LIMIT 1",
+        )
+        .bind(episode_id)
+        .bind(&survivor_s)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if has_supports.is_none() {
+            sqlx::query(
+                "INSERT INTO temporal_edges
+                   (id, edge_type, source_id, source_type, target_id, target_type,
+                    valid_from, valid_to, ingested_at, confidence, evidence_refs)
+                 VALUES (?, 'supports', ?, 'episode', ?, 'decision', ?, NULL, ?, ?, ?)",
+            )
+            .bind(Uuid::new_v4().to_string())
+            .bind(episode_id)
+            .bind(&survivor_s)
+            .bind(now)
+            .bind(now)
+            .bind(similarity)
+            .bind(serde_json::to_string(&[episode_id]).unwrap())
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        for constraint_id in move_constraint_ids {
+            sqlx::query(
+                "UPDATE constraints SET decision_id = ?
+                  WHERE id = ? AND decision_id = ? AND valid_to IS NULL",
+            )
+            .bind(&survivor_s)
+            .bind(constraint_id)
+            .bind(&loser_s)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "UPDATE temporal_edges SET source_id = ?
+                  WHERE edge_type = 'imposes' AND source_id = ? AND target_id = ?
+                    AND valid_to IS NULL",
+            )
+            .bind(&survivor_s)
+            .bind(&loser_s)
+            .bind(constraint_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        // Code links: move those to files the survivor is not linked to, close the rest.
+        sqlx::query(
+            "UPDATE decision_code_links SET decision_id = ?1
+              WHERE decision_id = ?2 AND valid_to IS NULL
+                AND file_path NOT IN (SELECT file_path FROM decision_code_links
+                                       WHERE decision_id = ?1 AND valid_to IS NULL)",
+        )
+        .bind(&survivor_s)
+        .bind(&loser_s)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE decision_code_links SET valid_to = ? WHERE decision_id = ? AND valid_to IS NULL",
+        )
+        .bind(now)
+        .bind(&loser_s)
+        .execute(&mut *tx)
+        .await?;
+
+        // Git links: `OR IGNORE` skips any the survivor already has (unique index).
+        sqlx::query(
+            "UPDATE OR IGNORE decision_git_links SET decision_id = ?
+              WHERE decision_id = ? AND valid_to IS NULL",
+        )
+        .bind(&survivor_s)
+        .bind(&loser_s)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE decision_git_links SET valid_to = ? WHERE decision_id = ? AND valid_to IS NULL",
+        )
+        .bind(now)
+        .bind(&loser_s)
+        .execute(&mut *tx)
+        .await?;
+
+        // Open temporal edges touching the loser: re-point unless the survivor
+        // already has the same edge, then close whatever is left (this includes
+        // `imposes` edges to constraints that were duplicates and get closed).
+        sqlx::query(
+            "UPDATE temporal_edges SET target_id = ?1
+              WHERE target_type = 'decision' AND target_id = ?2 AND valid_to IS NULL
+                AND edge_type != 'imposes'
+                AND NOT EXISTS (SELECT 1 FROM temporal_edges t
+                                 WHERE t.edge_type = temporal_edges.edge_type
+                                   AND t.source_id = temporal_edges.source_id
+                                   AND t.target_id = ?1 AND t.valid_to IS NULL)",
+        )
+        .bind(&survivor_s)
+        .bind(&loser_s)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE temporal_edges SET source_id = ?1
+              WHERE source_type = 'decision' AND source_id = ?2 AND valid_to IS NULL
+                AND edge_type != 'imposes'
+                AND NOT EXISTS (SELECT 1 FROM temporal_edges t
+                                 WHERE t.edge_type = temporal_edges.edge_type
+                                   AND t.source_id = ?1
+                                   AND t.target_id = temporal_edges.target_id
+                                   AND t.valid_to IS NULL)",
+        )
+        .bind(&survivor_s)
+        .bind(&loser_s)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE temporal_edges SET valid_to = ?1
+              WHERE valid_to IS NULL
+                AND ((target_type = 'decision' AND target_id = ?2)
+                  OR (source_type = 'decision' AND source_id = ?2))",
+        )
+        .bind(now)
+        .bind(&loser_s)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+
+        self.retract_decision(loser, now).await?;
+        Ok(())
+    }
+
     pub async fn file_paths_linked_to_decision(
         &self,
         decision_id: &str,
@@ -362,5 +554,4 @@ impl SqliteStore {
             })
             .collect())
     }
-
 }
