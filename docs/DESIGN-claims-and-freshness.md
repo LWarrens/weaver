@@ -2,8 +2,8 @@
 
 ## Status
 
-Draft v2 — Phase 4 candidate. Supersedes the "Open Requirements" in
-`ENGINEERING_REQUIREMENTS.md` (evidence-span population) and the tracked gap
+Draft v2 — Phase 4 candidate. Supersedes the earlier open requirement for
+evidence-span population and the tracked gap
 "`evidence_spans` population: not implemented" in `TECHNICAL_BEHAVIOR.md`.
 
 v2 revision incorporates two pieces of prior art:
@@ -730,8 +730,7 @@ rather than a separate `index_manifest` tool — KISS, one surface for lane stat
 
 Docs updated per step: `README.md` (Phase 4 list, tool docs, response shape),
 `TECHNICAL_BEHAVIOR.md` (per-tool sections, migration list, close the
-`evidence_spans` gap), `ENGINEERING_REQUIREMENTS.md` (REQ-053..058, component
-table, remove the two Open Requirements).
+`evidence_spans` gap).
 
 ## Open questions
 
